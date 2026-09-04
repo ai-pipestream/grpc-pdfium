@@ -1,0 +1,20 @@
+# CI gates for grpc-pdfium: the image build compiles the service and runs
+# the ctest suite, so a green run here and a green local image build mean
+# the same thing.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The image build runs the test suite itself, so this also proves the
+      # tests pass in a clean container with no host toolchain state.
+      - name: docker build
+        run: docker build -t grpc-pdfium:ci .
