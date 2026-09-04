@@ -16,6 +16,9 @@ class PdfiumEngine {
   // else; safe to call again.
   static void InitProcess();
 
+  // The backend identity string reported in BackendCapabilities.
+  static const char* BackendName();
+
   // The engine identity string reported in BackendCapabilities.
   static const char* EngineVersion();
 

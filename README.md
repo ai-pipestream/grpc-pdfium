@@ -23,6 +23,19 @@ runs as a pool of single-threaded worker processes behind a gRPC front
 unix sockets, die with the front (`PR_SET_PDEATHSIG`), and a crash on a
 hostile document costs one worker, which is respawned.
 
+The content-addressed handshake (`PdfDocument.sha256`) is served by the
+front process, which owns the client-facing wire: it verifies a supplied
+hash against the bytes (a mismatch answers `LOAD_STATUS_HASH_MISMATCH`),
+caches verified bytes, and answers hash-only lookups from the cache (a miss
+answers `LOAD_STATUS_BYTES_REQUIRED`). Both verdicts are typed on each
+RPC's own surface: `ProbeResponse.capabilities`, the `Parse` header, the
+`RenderResponse` head. Workers always receive full bytes over their unix
+sockets and stay stateless, so a worker respawn never loses cached content.
+The cache is an in-memory LRU bounded by document count
+(`GRPC_PDFIUM_CACHE_MAX_DOCUMENTS`, default 8; 0 disables) and by total
+bytes (`GRPC_PDFIUM_CACHE_MAX_BYTES`, default 2 GiB). Hashes come from the
+boringssl the gRPC build already carries.
+
 ## Build and test
 
 ```bash

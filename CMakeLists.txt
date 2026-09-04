@@ -31,16 +31,16 @@ FetchContent_MakeAvailable(grpc)
 # holds the same bytes. -DPDF_PROTO_LOCAL_DIR=<directory holding the .proto
 # files> overrides for contract development only.
 # ---------------------------------------------------------------------------
-set(PDF_PROTOS_COMMIT "fba7556c073dba4f907a94841c358424c6786962"
+set(PDF_PROTOS_COMMIT "4d72ec2c4550f8110ba03550f659c931d57e024d"
     CACHE STRING "parser-protos commit the contract comes from")
 set(PDF_PROTOS_BASE_URL
     "https://git.rokkon.com/ai-pipestream/parser-protos/raw/commit/${PDF_PROTOS_COMMIT}/proto/ai/protomolt/parse/pdf/v1"
     CACHE STRING "base URL the contract proto files are downloaded from")
 set(PDF_PROTO_TYPES_SHA256
-    "86c4bc05e92e640d2defdfac861cf9cea747da3cb38268f933380a4f76bb0fda"
+    "5570baad185a6f008976c8f013a48382b04c83b54a60ccdf94b0cd0a65bf2cce"
     CACHE STRING "sha256 of pdf_backend_types.proto")
 set(PDF_PROTO_SERVICE_SHA256
-    "b50b551beb869af100860c6be1bca8832fff27622be0a6f882fb347e72792a98"
+    "ae8ae5bb765e771b98176501ffc59583bf0c0428b7aa45e37e011f1e02aeeecd"
     CACHE STRING "sha256 of pdf_backend_service.proto")
 set(PDF_PROTO_LOCAL_DIR "" CACHE PATH "directory holding the contract protos, instead of the pinned download")
 
@@ -147,13 +147,17 @@ target_link_libraries(pdf_backend_proto PUBLIC grpc++ grpc++_reflection libproto
 # ---------------------------------------------------------------------------
 add_executable(grpc_pdfium
   src/main.cpp
+  src/byte_cache.cpp
   src/pdf_backend_service_impl.cpp
   src/pdfium_engine.cpp
   src/pdfium_tier12.cpp
   src/proxy_service_impl.cpp
+  src/sha256.cpp
   src/worker_pool.cpp)
 target_include_directories(grpc_pdfium PRIVATE src)
-target_link_libraries(grpc_pdfium PRIVATE pdf_backend_proto pdfium grpc_pdfium_flags)
+# crypto is the boringssl target gRPC already builds (the module SSL
+# provider); it supplies the SHA-256 of the content-addressed handshake.
+target_link_libraries(grpc_pdfium PRIVATE pdf_backend_proto pdfium crypto grpc_pdfium_flags)
 
 # ---------------------------------------------------------------------------
 # Tests: in-process round-trip through real gRPC stubs, plus a pool test
@@ -180,9 +184,9 @@ target_link_libraries(tier12_fixture_test PRIVATE pdf_backend_proto pdfium grpc_
 add_test(NAME tier12_fixture COMMAND tier12_fixture_test
   "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
 
-add_executable(pool_roundtrip_test test/pool_roundtrip_test.cpp)
+add_executable(pool_roundtrip_test test/pool_roundtrip_test.cpp src/sha256.cpp)
 target_include_directories(pool_roundtrip_test PRIVATE src)
-target_link_libraries(pool_roundtrip_test PRIVATE pdf_backend_proto grpc_pdfium_flags)
+target_link_libraries(pool_roundtrip_test PRIVATE pdf_backend_proto crypto grpc_pdfium_flags)
 add_test(NAME pool_roundtrip COMMAND pool_roundtrip_test
   "$<TARGET_FILE:grpc_pdfium>"
   "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/hello.pdf")

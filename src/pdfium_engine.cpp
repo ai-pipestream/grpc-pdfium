@@ -306,6 +306,8 @@ void PdfiumEngine::InitProcess() {
   initialized = true;
 }
 
+const char* PdfiumEngine::BackendName() { return kBackendName; }
+
 const char* PdfiumEngine::EngineVersion() { return kEngineVersion; }
 
 void PdfiumEngine::Probe(const pdfv1::PdfDocument& document,

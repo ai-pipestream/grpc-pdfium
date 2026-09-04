@@ -9,6 +9,7 @@
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
 
+#include "byte_cache.h"
 #include "pdf_backend_service_impl.h"
 #include "pdfium_engine.h"
 #include "proxy_service_impl.h"
@@ -56,6 +57,17 @@ int RunFront() {
     pool_size = std::max(1, std::atoi(workers_env));
   }
 
+  // The content-addressed byte cache bounds: how many documents, and their
+  // summed size. GRPC_PDFIUM_CACHE_MAX_DOCUMENTS=0 disables the cache.
+  size_t cache_max_documents = 8;
+  if (const char* env = std::getenv("GRPC_PDFIUM_CACHE_MAX_DOCUMENTS")) {
+    cache_max_documents = std::strtoull(env, nullptr, 10);
+  }
+  size_t cache_max_bytes = 2ULL << 30;
+  if (const char* env = std::getenv("GRPC_PDFIUM_CACHE_MAX_BYTES")) {
+    cache_max_bytes = std::strtoull(env, nullptr, 10);
+  }
+
   std::string socket_dir_template = "/tmp/grpc-pdfium-XXXXXX";
   char* socket_dir = mkdtemp(socket_dir_template.data());
   if (socket_dir == nullptr) {
@@ -67,7 +79,8 @@ int RunFront() {
   grpc::reflection::InitProtoReflectionServerBuilderPlugin();
 
   grpc_pdfium::WorkerPool pool(SelfExe(), socket_dir, pool_size);
-  grpc_pdfium::ProxyServiceImpl service(&pool);
+  grpc_pdfium::ByteCache byte_cache(cache_max_documents, cache_max_bytes);
+  grpc_pdfium::ProxyServiceImpl service(&pool, &byte_cache);
   grpc::ServerBuilder builder;
   builder.SetMaxReceiveMessageSize(kMaxMessageBytes);
   builder.SetMaxSendMessageSize(kMaxMessageBytes);
