@@ -10,9 +10,11 @@
 #include <vector>
 
 #include "fpdf_edit.h"
+#include "fpdf_formfill.h"
 #include "fpdf_text.h"
 #include "fpdf_transformpage.h"
 #include "fpdfview.h"
+#include "pdfium_tier12.h"
 
 namespace grpc_pdfium {
 
@@ -107,15 +109,6 @@ void LoadDocument(const pdfv1::PdfDocument& request, LoadedDocument* out) {
   }
 }
 
-// The families this build fills. Everything else is declared unsupported
-// until the tier 1-2 milestone lands.
-const pdfv1::PdfFamily kSupportedFamilies[] = {
-    pdfv1::PDF_FAMILY_PAGE_INVENTORY,
-    pdfv1::PDF_FAMILY_TEXT_CELLS,
-    pdfv1::PDF_FAMILY_PAGE_RASTER,
-    pdfv1::PDF_FAMILY_FONTS,
-};
-
 void FillCapabilities(const LoadedDocument& loaded,
                       pdfv1::BackendCapabilities* caps) {
   caps->set_backend_name(kBackendName);
@@ -127,20 +120,31 @@ void FillCapabilities(const LoadedDocument& loaded,
   }
   caps->set_page_count(
       static_cast<uint32_t>(FPDF_GetPageCount(loaded.doc)));
+  const tier12::DocFacts facts = tier12::GatherDocFacts(loaded.doc);
   for (int f = pdfv1::PdfFamily_MIN + 1; f <= pdfv1::PdfFamily_MAX; ++f) {
     if (!pdfv1::PdfFamily_IsValid(f)) continue;
     auto family = static_cast<pdfv1::PdfFamily>(f);
     auto* verdict = caps->add_families();
     verdict->set_family(family);
-    bool supported = std::find(std::begin(kSupportedFamilies),
-                               std::end(kSupportedFamilies),
-                               family) != std::end(kSupportedFamilies);
-    if (supported) {
-      verdict->set_support(pdfv1::FAMILY_SUPPORT_SUPPORTED);
-    } else {
-      verdict->set_support(pdfv1::FAMILY_SUPPORT_UNSUPPORTED_BY_BACKEND);
-      verdict->set_detail("tier 1-2 families land in a later milestone");
+    // Document-level families the engine can count cheaply get a real
+    // per-document verdict; page-scoped families report SUPPORTED, which
+    // means "the backend emits whatever the document holds".
+    bool absent = false;
+    switch (family) {
+      case pdfv1::PDF_FAMILY_STRUCT_TREE: absent = !facts.tagged; break;
+      case pdfv1::PDF_FAMILY_ENCRYPTION_INFO: absent = !facts.encrypted; break;
+      case pdfv1::PDF_FAMILY_OUTLINE: absent = !facts.has_outline; break;
+      case pdfv1::PDF_FAMILY_SIGNATURES: absent = facts.signature_count == 0; break;
+      case pdfv1::PDF_FAMILY_JAVASCRIPT: absent = facts.javascript_count == 0; break;
+      case pdfv1::PDF_FAMILY_ATTACHMENTS: absent = facts.attachment_count == 0; break;
+      case pdfv1::PDF_FAMILY_DEEP_RESOURCES:
+        verdict->set_support(pdfv1::FAMILY_SUPPORT_UNSUPPORTED_BY_BACKEND);
+        verdict->set_detail("the engine does not type out page resources");
+        continue;
+      default: break;
     }
+    verdict->set_support(absent ? pdfv1::FAMILY_SUPPORT_ABSENT_IN_DOCUMENT
+                                : pdfv1::FAMILY_SUPPORT_SUPPORTED);
   }
 }
 
@@ -173,31 +177,10 @@ void FillPageInfo(FPDF_DOCUMENT doc, FPDF_PAGE page, int index,
   }
 }
 
-// Assigns stable ids to (name, flags) font identities within one stream.
-class FontTable {
- public:
-  // Returns the id, marking the identity for emission when new.
-  uint32_t Intern(const std::string& name, int flags, bool* is_new) {
-    auto key = std::make_pair(name, flags);
-    auto it = ids_.find(key);
-    if (it != ids_.end()) {
-      *is_new = false;
-      return it->second;
-    }
-    uint32_t id = static_cast<uint32_t>(ids_.size());
-    ids_.emplace(key, id);
-    *is_new = true;
-    return id;
-  }
-
- private:
-  std::map<std::pair<std::string, int>, uint32_t> ids_;
-};
-
 // Extracts text cells for one page: one cell per PDFium text rect, text via
 // the bounded lookup, font identity from the character at the rect center.
 void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
-                      FontTable* fonts, pdfv1::FontTableChunk* new_fonts,
+                      FontInterner* fonts, pdfv1::FontTableChunk* new_fonts,
                       uint64_t* cell_count) {
   FPDF_TEXTPAGE text_page = FPDFText_LoadPage(page);
   if (text_page == nullptr) return;
@@ -323,16 +306,24 @@ bool PdfiumEngine::Parse(
     end = std::min<int>(static_cast<int>(request.pages().end()), page_count);
   }
 
-  bool want_text = true;
-  if (!request.families().empty()) {
-    want_text = std::find(request.families().begin(), request.families().end(),
-                          pdfv1::PDF_FAMILY_TEXT_CELLS) !=
-                request.families().end();
+  const tier12::DocFacts facts = tier12::GatherDocFacts(loaded.doc);
+  client_ok = tier12::EmitDocLevelFamilies(loaded.doc, request, facts, emit);
+
+  // Form-field access goes through a form-fill environment; a zeroed
+  // struct with just the version is the read-only setup.
+  FPDF_FORMFILLINFO form_info;
+  std::memset(&form_info, 0, sizeof(form_info));
+  form_info.version = 2;
+  FPDF_FORMHANDLE form_handle = nullptr;
+  if (client_ok && tier12::WantFamily(request, pdfv1::PDF_FAMILY_FORM_FIELDS)) {
+    form_handle = FPDFDOC_InitFormFillEnvironment(loaded.doc, &form_info);
   }
 
-  FontTable fonts;
-  uint64_t cell_total = 0;
-  uint64_t font_total = 0;
+  const bool want_text =
+      tier12::WantFamily(request, pdfv1::PDF_FAMILY_TEXT_CELLS);
+  FontInterner fonts;
+  std::map<pdfv1::PdfFamily, uint64_t> counts;
+  counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] = static_cast<uint64_t>(page_count);
   for (int i = begin; client_ok && i < end; ++i) {
     FPDF_PAGE page = pages[static_cast<size_t>(i)];
     if (page == nullptr) continue;
@@ -340,18 +331,44 @@ bool PdfiumEngine::Parse(
     auto* chunk = page_msg.mutable_page();
     chunk->set_page_index(static_cast<uint32_t>(i));
     pdfv1::FontTableChunk new_fonts;
+    std::vector<pdfv1::EmbeddedFont> embedded_fonts;
     if (want_text) {
-      ExtractTextCells(page, chunk, &fonts, &new_fonts, &cell_total);
+      ExtractTextCells(page, chunk, &fonts, &new_fonts,
+                       &counts[pdfv1::PDF_FAMILY_TEXT_CELLS]);
     }
+    tier12::ExtractPageTier12(loaded.doc, page, form_handle, request, &fonts,
+                              chunk, &new_fonts, &embedded_fonts);
+    counts[pdfv1::PDF_FAMILY_PLACED_IMAGES] += chunk->images_size();
+    counts[pdfv1::PDF_FAMILY_HYPERLINKS] += chunk->hyperlinks_size();
+    counts[pdfv1::PDF_FAMILY_ANNOTATIONS] += chunk->annotations_size();
+    counts[pdfv1::PDF_FAMILY_FORM_FIELDS] += chunk->form_fields_size();
+    counts[pdfv1::PDF_FAMILY_VECTOR_SHAPES] += chunk->shapes_size();
+    if (chunk->has_thumbnail()) ++counts[pdfv1::PDF_FAMILY_THUMBNAILS];
     if (new_fonts.fonts_size() > 0) {
-      font_total += static_cast<uint64_t>(new_fonts.fonts_size());
+      counts[pdfv1::PDF_FAMILY_FONTS] +=
+          static_cast<uint64_t>(new_fonts.fonts_size());
       pdfv1::ParseResponse fonts_msg;
       *fonts_msg.mutable_fonts() = new_fonts;
       client_ok = emit(fonts_msg);
       if (!client_ok) break;
     }
     client_ok = emit(page_msg);
+    for (auto& program : embedded_fonts) {
+      if (!client_ok) break;
+      pdfv1::ParseResponse font_msg;
+      *font_msg.mutable_embedded_font() = std::move(program);
+      ++counts[pdfv1::PDF_FAMILY_EMBEDDED_FONTS];
+      client_ok = emit(font_msg);
+    }
   }
+
+  if (client_ok && facts.tagged &&
+      tier12::WantFamily(request, pdfv1::PDF_FAMILY_STRUCT_TREE)) {
+    client_ok = tier12::EmitStructTree(
+        pages, emit, &counts[pdfv1::PDF_FAMILY_STRUCT_TREE]);
+  }
+
+  if (form_handle != nullptr) FPDFDOC_ExitFormFillEnvironment(form_handle);
   for (FPDF_PAGE p : pages) {
     if (p != nullptr) FPDF_ClosePage(p);
   }
@@ -359,15 +376,11 @@ bool PdfiumEngine::Parse(
 
   pdfv1::ParseResponse trailer_msg;
   auto* trailer = trailer_msg.mutable_trailer();
-  auto* page_counts = trailer->add_counts();
-  page_counts->set_family(pdfv1::PDF_FAMILY_PAGE_INVENTORY);
-  page_counts->set_count(static_cast<uint64_t>(page_count));
-  auto* cell_counts = trailer->add_counts();
-  cell_counts->set_family(pdfv1::PDF_FAMILY_TEXT_CELLS);
-  cell_counts->set_count(cell_total);
-  auto* font_counts = trailer->add_counts();
-  font_counts->set_family(pdfv1::PDF_FAMILY_FONTS);
-  font_counts->set_count(font_total);
+  for (const auto& [family, count] : counts) {
+    auto* entry = trailer->add_counts();
+    entry->set_family(family);
+    entry->set_count(count);
+  }
   return emit(trailer_msg);
 }
 

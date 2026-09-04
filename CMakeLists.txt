@@ -140,6 +140,7 @@ add_executable(grpc_pdfium
   src/main.cpp
   src/pdf_backend_service_impl.cpp
   src/pdfium_engine.cpp
+  src/pdfium_tier12.cpp
   src/proxy_service_impl.cpp
   src/worker_pool.cpp)
 target_include_directories(grpc_pdfium PRIVATE src)
@@ -153,11 +154,22 @@ enable_testing()
 add_executable(pdf_backend_contract_test
   test/contract_roundtrip_test.cpp
   src/pdf_backend_service_impl.cpp
-  src/pdfium_engine.cpp)
+  src/pdfium_engine.cpp
+  src/pdfium_tier12.cpp)
 target_include_directories(pdf_backend_contract_test PRIVATE src)
 target_link_libraries(pdf_backend_contract_test PRIVATE pdf_backend_proto pdfium grpc_pdfium_flags)
 add_test(NAME contract_roundtrip COMMAND pdf_backend_contract_test
   "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/hello.pdf")
+
+add_executable(tier12_fixture_test
+  test/tier12_fixture_test.cpp
+  src/pdf_backend_service_impl.cpp
+  src/pdfium_engine.cpp
+  src/pdfium_tier12.cpp)
+target_include_directories(tier12_fixture_test PRIVATE src)
+target_link_libraries(tier12_fixture_test PRIVATE pdf_backend_proto pdfium grpc_pdfium_flags)
+add_test(NAME tier12_fixture COMMAND tier12_fixture_test
+  "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
 
 add_executable(pool_roundtrip_test test/pool_roundtrip_test.cpp)
 target_include_directories(pool_roundtrip_test PRIVATE src)

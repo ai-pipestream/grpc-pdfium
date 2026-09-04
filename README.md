@@ -5,12 +5,17 @@ A gRPC PDF backend service around PDFium, implementing the fleet's common
 pipestream-protos release this build pins). Apache-2.0, engine included:
 this is the standard PDF backend of the parsing fleet.
 
-Status: tier 0. The engine is the sha256-pinned PDFium prebuilt
-(chromium/8035, 154.0.8035.0, non-V8/non-XFA, the pypdfium2 precedent) and
-the floor families are served: typed load status, page inventory, text
-cells with font references, and page rasters. Tier 1-2 families are
-declared unsupported in `Probe` until they land (see gRParse
-`docs/pdf-backend-services.md`, milestone M2).
+Status: tiers 0-2. The engine is the sha256-pinned PDFium prebuilt
+(chromium/8035, 154.0.8035.0, non-V8/non-XFA, the pypdfium2 precedent).
+Served families: typed load status, page inventory, text cells with font
+references, page rasters, document metadata, encryption info, fonts with
+embedded programs, placed images, hyperlinks, outline, annotations, form
+fields, attachments, vector shapes, the tagged structure tree, signatures,
+JavaScript listing, and page thumbnails. `Probe` gives per-document
+verdicts (a document without an outline declares the family absent); deep
+graphics resources are declared unsupported, since this engine does not
+type them out. Engine limits worth knowing: no XMP packet and no custom
+info keys reach the public API, so `DocMeta` fills the standard keys only.
 
 PDFium keeps process-global state and is not thread-safe, so the service
 runs as a pool of single-threaded worker processes behind a gRPC front
