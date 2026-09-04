@@ -67,6 +67,40 @@ configure_file("${PDF_PROTO_SRC}/pdf_backend_types.proto"
 configure_file("${PDF_PROTO_SRC}/pdf_backend_service.proto"
   "${STAGED_PROTO_DIR}/${PDF_PROTO_REL}/pdf_backend_service.proto" COPYONLY)
 
+# ---------------------------------------------------------------------------
+# The PDFium engine, from the sha256-pinned prebuilt binary release
+# (bblanchon/pdfium-binaries, the pypdfium2 precedent). Non-V8, non-XFA.
+# ---------------------------------------------------------------------------
+set(PDFIUM_RELEASE "chromium/8035" CACHE STRING "pdfium-binaries release tag")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  set(PDFIUM_ARCH "arm64")
+  set(PDFIUM_SHA256_DEFAULT
+      "10bb7728a5268593a31c2024e0e57ea26b73b7a54195054f43d2ad0869d55a48")
+else()
+  set(PDFIUM_ARCH "x64")
+  set(PDFIUM_SHA256_DEFAULT
+      "2e6db042dd2cff2d5247023dbec6c7ebb800042ce83c835d6468d45229669bd4")
+endif()
+set(PDFIUM_SHA256 "${PDFIUM_SHA256_DEFAULT}" CACHE STRING "sha256 of the pdfium prebuilt tarball")
+string(REPLACE "/" "%2F" PDFIUM_RELEASE_ESCAPED "${PDFIUM_RELEASE}")
+set(PDFIUM_TGZ "${CMAKE_CURRENT_BINARY_DIR}/pdfium-linux-${PDFIUM_ARCH}.tgz")
+if(NOT EXISTS "${PDFIUM_TGZ}")
+  file(DOWNLOAD
+    "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_RELEASE_ESCAPED}/pdfium-linux-${PDFIUM_ARCH}.tgz"
+    "${PDFIUM_TGZ}"
+    EXPECTED_HASH SHA256=${PDFIUM_SHA256}
+    STATUS PDFIUM_DL_STATUS)
+  list(GET PDFIUM_DL_STATUS 0 PDFIUM_DL_CODE)
+  if(NOT PDFIUM_DL_CODE EQUAL 0)
+    file(REMOVE "${PDFIUM_TGZ}")
+    message(FATAL_ERROR "pdfium tarball download failed: ${PDFIUM_DL_STATUS}")
+  endif()
+endif()
+set(PDFIUM_DIR "${CMAKE_CURRENT_BINARY_DIR}/pdfium")
+file(ARCHIVE_EXTRACT INPUT "${PDFIUM_TGZ}" DESTINATION "${PDFIUM_DIR}")
+set(PDFium_DIR "${PDFIUM_DIR}")
+find_package(PDFium REQUIRED CONFIG PATHS "${PDFIUM_DIR}" NO_DEFAULT_PATH)
+
 set(GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${GENERATED_DIR}")
 
@@ -99,21 +133,35 @@ target_include_directories(pdf_backend_proto SYSTEM PUBLIC "${GENERATED_DIR}")
 target_link_libraries(pdf_backend_proto PUBLIC grpc++ grpc++_reflection libprotobuf)
 
 # ---------------------------------------------------------------------------
-# The service binary.
+# The service binary: front (worker pool + proxy) and worker in one
+# executable, selected by --worker.
 # ---------------------------------------------------------------------------
 add_executable(grpc_pdfium
   src/main.cpp
-  src/pdf_backend_service_impl.cpp)
+  src/pdf_backend_service_impl.cpp
+  src/pdfium_engine.cpp
+  src/proxy_service_impl.cpp
+  src/worker_pool.cpp)
 target_include_directories(grpc_pdfium PRIVATE src)
-target_link_libraries(grpc_pdfium PRIVATE pdf_backend_proto grpc_pdfium_flags)
+target_link_libraries(grpc_pdfium PRIVATE pdf_backend_proto pdfium grpc_pdfium_flags)
 
 # ---------------------------------------------------------------------------
-# Tests: in-process round-trip through real gRPC stubs.
+# Tests: in-process round-trip through real gRPC stubs, plus a pool test
+# against the real front binary.
 # ---------------------------------------------------------------------------
 enable_testing()
 add_executable(pdf_backend_contract_test
   test/contract_roundtrip_test.cpp
-  src/pdf_backend_service_impl.cpp)
+  src/pdf_backend_service_impl.cpp
+  src/pdfium_engine.cpp)
 target_include_directories(pdf_backend_contract_test PRIVATE src)
-target_link_libraries(pdf_backend_contract_test PRIVATE pdf_backend_proto grpc_pdfium_flags)
-add_test(NAME contract_roundtrip COMMAND pdf_backend_contract_test)
+target_link_libraries(pdf_backend_contract_test PRIVATE pdf_backend_proto pdfium grpc_pdfium_flags)
+add_test(NAME contract_roundtrip COMMAND pdf_backend_contract_test
+  "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/hello.pdf")
+
+add_executable(pool_roundtrip_test test/pool_roundtrip_test.cpp)
+target_include_directories(pool_roundtrip_test PRIVATE src)
+target_link_libraries(pool_roundtrip_test PRIVATE pdf_backend_proto grpc_pdfium_flags)
+add_test(NAME pool_roundtrip COMMAND pool_roundtrip_test
+  "$<TARGET_FILE:grpc_pdfium>"
+  "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/hello.pdf")

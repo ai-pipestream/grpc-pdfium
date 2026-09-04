@@ -1,9 +1,12 @@
-// The M0 walking-skeleton gate: start the real service on a local port,
-// dial it through the generated client stubs, and check that Probe and
-// Parse round-trip typed data from the released contract.
+// Tier 0 contract test: start the engine-backed service in process, dial
+// it through the generated client stubs, and check Probe, Parse, and
+// Render against the hello.pdf fixture (one Letter page, Helvetica 24pt
+// "Hello PDF" at (100, 700)).
 
 #include <cstdio>
+#include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 
 #include <grpcpp/grpcpp.h>
@@ -23,9 +26,23 @@ void Check(bool ok, const char* what) {
   }
 }
 
+std::string ReadFile(const char* path) {
+  std::ifstream in(path, std::ios::binary);
+  std::ostringstream buf;
+  buf << in.rdbuf();
+  return buf.str();
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc != 2) {
+    std::fprintf(stderr, "usage: %s <hello.pdf>\n", argv[0]);
+    return 2;
+  }
+  const std::string fixture = ReadFile(argv[1]);
+  Check(!fixture.empty(), "fixture PDF read");
+
   grpc_pdfium::PdfBackendServiceImpl service;
   grpc::ServerBuilder builder;
   int port = 0;
@@ -33,31 +50,38 @@ int main() {
                            &port);
   builder.RegisterService(&service);
   std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
-  Check(server != nullptr, "server started");
-  Check(port != 0, "server bound a port");
+  Check(server != nullptr && port != 0, "server started");
 
   auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
                                      grpc::InsecureChannelCredentials());
   auto stub = pdfv1::PdfBackendService::NewStub(channel);
 
-  // Probe with PDF magic: identity plus the typed skeleton load status.
+  // Probe the fixture: it loads, has one page, and every family has a
+  // verdict.
   {
     grpc::ClientContext ctx;
     pdfv1::ProbeRequest request;
-    request.mutable_document()->set_data("%PDF-1.7\n%skeleton");
+    request.mutable_document()->set_data(fixture);
     pdfv1::ProbeResponse response;
     grpc::Status status = stub->Probe(&ctx, request, &response);
     Check(status.ok(), "Probe RPC succeeded");
-    Check(response.capabilities().backend_name() == "grpc-pdfium",
-          "Probe reports the backend name");
-    Check(response.capabilities().load_status() ==
-              pdfv1::LOAD_STATUS_ENGINE_ERROR,
-          "skeleton reports LOAD_STATUS_ENGINE_ERROR for PDF bytes");
-    Check(!response.capabilities().engine_version().empty(),
-          "Probe reports an engine version string");
+    const auto& caps = response.capabilities();
+    Check(caps.backend_name() == "grpc-pdfium", "backend name reported");
+    Check(caps.load_status() == pdfv1::LOAD_STATUS_OK, "fixture loads OK");
+    Check(caps.page_count() == 1, "fixture has one page");
+    Check(caps.families_size() == pdfv1::PdfFamily_MAX,
+          "every family has a verdict");
+    bool text_supported = false;
+    for (const auto& f : caps.families()) {
+      if (f.family() == pdfv1::PDF_FAMILY_TEXT_CELLS &&
+          f.support() == pdfv1::FAMILY_SUPPORT_SUPPORTED) {
+        text_supported = true;
+      }
+    }
+    Check(text_supported, "text cells are a supported family");
   }
 
-  // Probe without PDF magic: typed NOT_PDF.
+  // Probe non-PDF bytes: typed NOT_PDF.
   {
     grpc::ClientContext ctx;
     pdfv1::ProbeRequest request;
@@ -69,34 +93,125 @@ int main() {
           "non-PDF bytes report LOAD_STATUS_NOT_PDF");
   }
 
-  // Parse: header arrives first and the stream ends after it on a failed
-  // load, per the contract.
+  // Parse the fixture: header with inventory, a font table entry, the text
+  // cell, and trailer counts.
   {
     grpc::ClientContext ctx;
     pdfv1::ParseRequest request;
-    request.mutable_document()->set_data("%PDF-1.7\n%skeleton");
+    request.mutable_document()->set_data(fixture);
     auto reader = stub->Parse(&ctx, request);
     pdfv1::ParseResponse message;
-    Check(reader->Read(&message), "Parse stream produced a message");
-    Check(message.has_header(), "first Parse message is the header");
-    Check(message.header().capabilities().backend_name() == "grpc-pdfium",
-          "Parse header echoes capabilities");
-    Check(!reader->Read(&message), "Parse stream ended after the header");
+
+    Check(reader->Read(&message) && message.has_header(),
+          "Parse starts with the header");
+    const auto& header = message.header();
+    Check(header.capabilities().load_status() == pdfv1::LOAD_STATUS_OK,
+          "header capabilities show a loaded document");
+    Check(header.pages_size() == 1, "header inventory lists one page");
+    if (header.pages_size() == 1) {
+      const auto& page = header.pages(0);
+      Check(page.width_pts() > 611.0 && page.width_pts() < 613.0,
+            "page width is Letter");
+      Check(page.height_pts() > 791.0 && page.height_pts() < 793.0,
+            "page height is Letter");
+      Check(page.rotation_degrees() == 0, "page is unrotated");
+      Check(page.has_media_box() && page.has_crop_box(),
+            "page boxes are populated");
+    }
+
+    std::string all_text;
+    bool saw_fonts = false;
+    bool saw_trailer = false;
+    bool bbox_sane = true;
+    uint64_t trailer_cells = 0;
+    while (reader->Read(&message)) {
+      if (message.has_page()) {
+        for (const auto& cell : message.page().text_cells()) {
+          all_text += cell.text();
+          if (cell.bbox().x0() < 0 || cell.bbox().x1() > 612 ||
+              cell.bbox().y0() < 600 || cell.bbox().y1() > 792) {
+            bbox_sane = false;
+          }
+        }
+      } else if (message.has_fonts()) {
+        for (const auto& font : message.fonts().fonts()) {
+          if (font.base_name().find("Helvetica") != std::string::npos) {
+            saw_fonts = true;
+          }
+        }
+      } else if (message.has_trailer()) {
+        saw_trailer = true;
+        for (const auto& count : message.trailer().counts()) {
+          if (count.family() == pdfv1::PDF_FAMILY_TEXT_CELLS) {
+            trailer_cells = count.count();
+          }
+        }
+      }
+    }
     Check(reader->Finish().ok(), "Parse stream finished OK");
+    Check(all_text.find("Hello PDF") != std::string::npos,
+          "text cells contain the fixture text");
+    Check(bbox_sane, "text cell bboxes sit where the fixture drew them");
+    Check(saw_fonts, "font table names Helvetica");
+    Check(saw_trailer, "Parse ends with the trailer");
+    Check(trailer_cells >= 1, "trailer counts the text cells");
   }
 
-  // Render: typed gRPC error until the engine is linked.
+  // Render at 72 DPI: one Letter-sized BGR8 raster with ink on it.
   {
     grpc::ClientContext ctx;
     pdfv1::RenderRequest request;
-    request.mutable_document()->set_data("%PDF-1.7\n%skeleton");
+    request.mutable_document()->set_data(fixture);
     request.set_dpi(72.0);
     request.set_pixel_format(pdfv1::PIXEL_FORMAT_BGR8);
     auto reader = stub->Render(&ctx, request);
     pdfv1::RenderResponse message;
-    Check(!reader->Read(&message), "Render stream is empty in the skeleton");
+    Check(reader->Read(&message), "Render produced a raster");
+    const auto& raster = message.raster();
+    Check(raster.width_px() == 612 && raster.height_px() == 792,
+          "raster is Letter at 72 DPI");
+    Check(raster.pixel_format() == pdfv1::PIXEL_FORMAT_BGR8,
+          "raster is BGR8");
+    Check(raster.stride_bytes() >= 612 * 3, "raster stride covers the row");
+    Check(raster.pixels().size() ==
+              static_cast<size_t>(raster.stride_bytes()) * raster.height_px(),
+          "raster payload matches stride * height");
+    bool has_ink = false;
+    for (unsigned char b : raster.pixels()) {
+      if (b != 0xFF) {
+        has_ink = true;
+        break;
+      }
+    }
+    Check(has_ink, "raster has non-white pixels (the text)");
+    Check(!reader->Read(&message), "single-page fixture renders one raster");
+    Check(reader->Finish().ok(), "Render stream finished OK");
+  }
+
+  // Render with a non-positive DPI: INVALID_ARGUMENT.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::RenderRequest request;
+    request.mutable_document()->set_data(fixture);
+    request.set_dpi(0.0);
+    auto reader = stub->Render(&ctx, request);
+    pdfv1::RenderResponse message;
+    Check(!reader->Read(&message), "zero-DPI render produced nothing");
+    Check(reader->Finish().error_code() == grpc::INVALID_ARGUMENT,
+          "zero DPI is INVALID_ARGUMENT");
+  }
+
+  // Render bytes that never loaded: FAILED_PRECONDITION.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::RenderRequest request;
+    request.mutable_document()->set_data("not a pdf");
+    request.set_dpi(72.0);
+    auto reader = stub->Render(&ctx, request);
+    pdfv1::RenderResponse message;
+    Check(!reader->Read(&message), "unloadable render produced nothing");
     Check(reader->Finish().error_code() == grpc::FAILED_PRECONDITION,
-          "Render fails with FAILED_PRECONDITION in the skeleton");
+          "unloadable document is FAILED_PRECONDITION");
   }
 
   server->Shutdown();

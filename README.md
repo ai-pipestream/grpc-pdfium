@@ -5,11 +5,18 @@ A gRPC PDF backend service around PDFium, implementing the fleet's common
 pipestream-protos release this build pins). Apache-2.0, engine included:
 this is the standard PDF backend of the parsing fleet.
 
-Status: walking skeleton. The contract is served in full and every RPC
-round-trips typed data, but the PDFium engine is not linked yet, so every
-document reports a typed load failure. The engine, the worker-process pool,
-and the tier 0 families land next (see gRParse
-`docs/pdf-backend-services.md`, milestone M1).
+Status: tier 0. The engine is the sha256-pinned PDFium prebuilt
+(chromium/8035, 154.0.8035.0, non-V8/non-XFA, the pypdfium2 precedent) and
+the floor families are served: typed load status, page inventory, text
+cells with font references, and page rasters. Tier 1-2 families are
+declared unsupported in `Probe` until they land (see gRParse
+`docs/pdf-backend-services.md`, milestone M2).
+
+PDFium keeps process-global state and is not thread-safe, so the service
+runs as a pool of single-threaded worker processes behind a gRPC front
+(`GRPC_PDFIUM_WORKERS`, default 4). Workers speak the same contract over
+unix sockets, die with the front (`PR_SET_PDEATHSIG`), and a crash on a
+hostile document costs one worker, which is respawned.
 
 ## Build and test
 

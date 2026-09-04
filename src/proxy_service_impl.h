@@ -3,16 +3,19 @@
 #include <grpcpp/grpcpp.h>
 
 #include "ai/pipestream/parse/pdf/v1/pdf_backend_service.grpc.pb.h"
+#include "worker_pool.h"
 
 namespace grpc_pdfium {
 
-// The engine-backed PdfBackendService implementation, served by each worker
-// process. Engine calls are serialized behind one process-wide mutex because
-// PDFium is process-global and not thread-safe; concurrency comes from the
-// worker-process pool in front, never from threads inside one process.
-class PdfBackendServiceImpl final
+// The front-door PdfBackendService: forwards every RPC to a leased worker
+// process over its unix socket and streams the responses through. A worker
+// failure before any response reached the client is retried once on a fresh
+// worker; a failure mid-stream surfaces to the client as UNAVAILABLE.
+class ProxyServiceImpl final
     : public ai::pipestream::parse::pdf::v1::PdfBackendService::Service {
  public:
+  explicit ProxyServiceImpl(WorkerPool* pool) : pool_(pool) {}
+
   grpc::Status Probe(
       grpc::ServerContext* context,
       const ai::pipestream::parse::pdf::v1::ProbeRequest* request,
@@ -29,6 +32,9 @@ class PdfBackendServiceImpl final
       const ai::pipestream::parse::pdf::v1::RenderRequest* request,
       grpc::ServerWriter<ai::pipestream::parse::pdf::v1::RenderResponse>*
           writer) override;
+
+ private:
+  WorkerPool* pool_;
 };
 
 }  // namespace grpc_pdfium
