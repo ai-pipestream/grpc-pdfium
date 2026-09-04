@@ -127,7 +127,7 @@ int main(int argc, char** argv) {
     while (reader->Read(&message)) {
       if (message.has_page()) {
         for (const auto& cell : message.page().text_cells()) {
-          all_text += cell.text();
+          all_text += cell.text() + " ";
           if (cell.bbox().x0() < 0 || cell.bbox().x1() > 612 ||
               cell.bbox().y0() < 600 || cell.bbox().y1() > 792) {
             bbox_sane = false;

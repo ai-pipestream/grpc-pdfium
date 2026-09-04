@@ -177,73 +177,116 @@ void FillPageInfo(FPDF_DOCUMENT doc, FPDF_PAGE page, int index,
   }
 }
 
-// Extracts text cells for one page: one cell per PDFium text rect, text via
-// the bounded lookup, font identity from the character at the rect center.
+// Whitespace as the word splitter: ASCII space controls plus the common
+// Unicode space code points the text page emits.
+bool IsWordBreak(unsigned short unit) {
+  if (unit <= 0x20) return true;
+  if (unit == 0xA0) return true;
+  if (unit >= 0x2000 && unit <= 0x200B) return true;
+  return unit == 0x2028 || unit == 0x2029 || unit == 0x3000 || unit == 0xFEFF;
+}
+
+// Extracts text cells for one page at word granularity, the same shape the
+// in-process poppler path emits: split the character stream on whitespace,
+// take the union of the text rects each word occupies, and read font
+// identity from the word's first character.
 void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
                       FontInterner* fonts, pdfv1::FontTableChunk* new_fonts,
                       uint64_t* cell_count) {
   FPDF_TEXTPAGE text_page = FPDFText_LoadPage(page);
   if (text_page == nullptr) return;
-  int rect_count = FPDFText_CountRects(text_page, 0, -1);
-  for (int r = 0; r < rect_count; ++r) {
-    double left = 0;
-    double top = 0;
-    double right = 0;
-    double bottom = 0;
-    if (!FPDFText_GetRect(text_page, r, &left, &top, &right, &bottom)) {
+  const int char_count = FPDFText_CountChars(text_page);
+  std::vector<unsigned short> units;
+  if (char_count > 0) {
+    units.resize(static_cast<size_t>(char_count) + 1);
+    FPDFText_GetText(text_page, 0, char_count, units.data());
+    units.resize(static_cast<size_t>(char_count));
+  }
+
+  int start = -1;
+  for (int i = 0; i <= char_count; ++i) {
+    const bool boundary =
+        i == char_count || IsWordBreak(units[static_cast<size_t>(i)]);
+    if (!boundary) {
+      if (start < 0) start = i;
       continue;
     }
-    int len = FPDFText_GetBoundedText(text_page, left, top, right, bottom,
-                                      nullptr, 0);
-    if (len <= 0) continue;
-    std::vector<unsigned short> units(static_cast<size_t>(len));
-    FPDFText_GetBoundedText(text_page, left, top, right, bottom, units.data(),
-                            len);
-    // The API contract NUL-terminates when the buffer has room; trim it.
-    while (!units.empty() && units.back() == 0) units.pop_back();
-    if (units.empty()) continue;
+    if (start < 0) continue;
+    const int count = i - start;
+    std::vector<unsigned short> word(units.begin() + start,
+                                     units.begin() + i);
+
+    double x0 = 0;
+    double y0 = 0;
+    double x1 = 0;
+    double y1 = 0;
+    bool has_box = false;
+    // Loose char boxes come from font metrics, not glyph ink, so every word
+    // on a line shares the same vertical extent. That uniformity is what
+    // downstream geometry sorts rely on (tight ink boxes make "page" start
+    // below "1" and reading order scrambles).
+    for (int c = start; c < start + count; ++c) {
+      FS_RECTF rect;
+      if (!FPDFText_GetLooseCharBox(text_page, c, &rect)) continue;
+      const double lo_x = std::min(rect.left, rect.right);
+      const double hi_x = std::max(rect.left, rect.right);
+      const double lo_y = std::min(rect.top, rect.bottom);
+      const double hi_y = std::max(rect.top, rect.bottom);
+      if (hi_x <= lo_x || hi_y <= lo_y) continue;
+      if (!has_box) {
+        x0 = lo_x;
+        y0 = lo_y;
+        x1 = hi_x;
+        y1 = hi_y;
+        has_box = true;
+      } else {
+        x0 = std::min(x0, lo_x);
+        y0 = std::min(y0, lo_y);
+        x1 = std::max(x1, hi_x);
+        y1 = std::max(y1, hi_y);
+      }
+    }
+    const int word_start = start;
+    start = -1;
+    if (!has_box) continue;
 
     auto* cell = chunk->add_text_cells();
-    cell->set_text(Utf16ToUtf8(units));
+    cell->set_text(Utf16ToUtf8(word));
     auto* bbox = cell->mutable_bbox();
-    bbox->set_x0(std::min(left, right));
-    bbox->set_y0(std::min(top, bottom));
-    bbox->set_x1(std::max(left, right));
-    bbox->set_y1(std::max(top, bottom));
+    bbox->set_x0(x0);
+    bbox->set_y0(y0);
+    bbox->set_x1(x1);
+    bbox->set_y1(y1);
     auto* quad = cell->mutable_quad();
-    quad->set_x0(bbox->x0());
-    quad->set_y0(bbox->y0());
-    quad->set_x1(bbox->x1());
-    quad->set_y1(bbox->y0());
-    quad->set_x2(bbox->x1());
-    quad->set_y2(bbox->y1());
-    quad->set_x3(bbox->x0());
-    quad->set_y3(bbox->y1());
+    quad->set_x0(x0);
+    quad->set_y0(y0);
+    quad->set_x1(x1);
+    quad->set_y1(y0);
+    quad->set_x2(x1);
+    quad->set_y2(y1);
+    quad->set_x3(x0);
+    quad->set_y3(y1);
 
-    int char_index = FPDFText_GetCharIndexAtPos(
-        text_page, (left + right) / 2.0, (top + bottom) / 2.0, 3.0, 3.0);
-    if (char_index >= 0) {
-      cell->set_font_size(FPDFText_GetFontSize(text_page, char_index));
-      char name_buf[256];
-      int flags = 0;
-      unsigned long name_len = FPDFText_GetFontInfo(
-          text_page, char_index, name_buf, sizeof(name_buf), &flags);
-      if (name_len > 0) {
-        std::string name(name_buf,
-                         std::min<unsigned long>(name_len, sizeof(name_buf)));
-        // The reported length includes the trailing NUL.
-        while (!name.empty() && name.back() == '\0') name.pop_back();
-        bool is_new = false;
-        uint32_t id = fonts->Intern(name, flags, &is_new);
-        cell->set_font_id(id);
-        if (is_new) {
-          auto* ref = new_fonts->add_fonts();
-          ref->set_font_id(id);
-          ref->set_base_name(name);
-          ref->set_descriptor_flags(static_cast<uint32_t>(flags));
-          // Embedded-program presence lands with the tier 1 font work; the
-          // tier 0 table reports identity and descriptor flags only.
-        }
+    cell->set_font_size(FPDFText_GetFontSize(text_page, word_start));
+    char name_buf[256];
+    int flags = 0;
+    unsigned long name_len = FPDFText_GetFontInfo(
+        text_page, word_start, name_buf, sizeof(name_buf), &flags);
+    if (name_len > 0) {
+      std::string name(name_buf,
+                       std::min<unsigned long>(name_len, sizeof(name_buf)));
+      // The reported length includes the trailing NUL.
+      while (!name.empty() && name.back() == '\0') name.pop_back();
+      bool is_new = false;
+      uint32_t id = fonts->Intern(name, flags, &is_new);
+      cell->set_font_id(id);
+      if (is_new) {
+        auto* ref = new_fonts->add_fonts();
+        ref->set_font_id(id);
+        ref->set_base_name(name);
+        ref->set_descriptor_flags(static_cast<uint32_t>(flags));
+        // Embedded-program presence lands with the tier 1 font work; the
+        // tier 0 table reports identity and descriptor flags only.
       }
     }
     ++*cell_count;

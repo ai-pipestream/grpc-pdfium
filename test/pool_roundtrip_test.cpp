@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
         if (message.has_trailer()) saw_trailer = true;
         if (message.has_page()) {
           for (const auto& cell : message.page().text_cells()) {
-            all_text += cell.text();
+            all_text += cell.text() + " ";
           }
         }
       }
