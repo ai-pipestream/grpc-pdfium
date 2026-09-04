@@ -2,7 +2,7 @@
 
 #include <grpcpp/grpcpp.h>
 
-#include "ai/pipestream/parse/pdf/v1/pdf_backend_service.grpc.pb.h"
+#include "ai/protomolt/parse/pdf/v1/pdf_backend_service.grpc.pb.h"
 
 namespace grpc_pdfium {
 
@@ -11,23 +11,23 @@ namespace grpc_pdfium {
 // PDFium is process-global and not thread-safe; concurrency comes from the
 // worker-process pool in front, never from threads inside one process.
 class PdfBackendServiceImpl final
-    : public ai::pipestream::parse::pdf::v1::PdfBackendService::Service {
+    : public ai::protomolt::parse::pdf::v1::PdfBackendService::Service {
  public:
   grpc::Status Probe(
       grpc::ServerContext* context,
-      const ai::pipestream::parse::pdf::v1::ProbeRequest* request,
-      ai::pipestream::parse::pdf::v1::ProbeResponse* response) override;
+      const ai::protomolt::parse::pdf::v1::ProbeRequest* request,
+      ai::protomolt::parse::pdf::v1::ProbeResponse* response) override;
 
   grpc::Status Parse(
       grpc::ServerContext* context,
-      const ai::pipestream::parse::pdf::v1::ParseRequest* request,
-      grpc::ServerWriter<ai::pipestream::parse::pdf::v1::ParseResponse>*
+      const ai::protomolt::parse::pdf::v1::ParseRequest* request,
+      grpc::ServerWriter<ai::protomolt::parse::pdf::v1::ParseResponse>*
           writer) override;
 
   grpc::Status Render(
       grpc::ServerContext* context,
-      const ai::pipestream::parse::pdf::v1::RenderRequest* request,
-      grpc::ServerWriter<ai::pipestream::parse::pdf::v1::RenderResponse>*
+      const ai::protomolt::parse::pdf::v1::RenderRequest* request,
+      grpc::ServerWriter<ai::protomolt::parse::pdf::v1::RenderResponse>*
           writer) override;
 };
 

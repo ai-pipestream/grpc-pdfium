@@ -2,7 +2,7 @@
 
 #include <functional>
 
-#include "ai/pipestream/parse/pdf/v1/pdf_backend_service.pb.h"
+#include "ai/protomolt/parse/pdf/v1/pdf_backend_service.pb.h"
 
 namespace grpc_pdfium {
 
@@ -20,24 +20,24 @@ class PdfiumEngine {
   static const char* EngineVersion();
 
   // Loads the document and fills the per-document capability verdicts.
-  static void Probe(const ai::pipestream::parse::pdf::v1::PdfDocument& document,
-                    ai::pipestream::parse::pdf::v1::BackendCapabilities* caps);
+  static void Probe(const ai::protomolt::parse::pdf::v1::PdfDocument& document,
+                    ai::protomolt::parse::pdf::v1::BackendCapabilities* caps);
 
   // Parses the tier 0 families, invoking emit for each stream message
   // (header first, then one PageChunk per page, then the trailer). Returns
   // false only when emit returned false (client gone).
   static bool Parse(
-      const ai::pipestream::parse::pdf::v1::ParseRequest& request,
+      const ai::protomolt::parse::pdf::v1::ParseRequest& request,
       const std::function<
-          bool(const ai::pipestream::parse::pdf::v1::ParseResponse&)>& emit);
+          bool(const ai::protomolt::parse::pdf::v1::ParseResponse&)>& emit);
 
   // Renders the requested pages, invoking emit per raster. Fills a typed
   // gRPC-style error into *error_message and returns false when the
   // document cannot be rendered.
   static bool Render(
-      const ai::pipestream::parse::pdf::v1::RenderRequest& request,
+      const ai::protomolt::parse::pdf::v1::RenderRequest& request,
       const std::function<
-          bool(const ai::pipestream::parse::pdf::v1::RenderResponse&)>& emit,
+          bool(const ai::protomolt::parse::pdf::v1::RenderResponse&)>& emit,
       std::string* error_message);
 };
 

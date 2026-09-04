@@ -1,7 +1,7 @@
 # grpc-pdfium
 
 A gRPC PDF backend service around PDFium, implementing the fleet's common
-`PdfBackendService` contract (`ai.pipestream.parse.pdf.v1`, from the
+`PdfBackendService` contract (`ai.protomolt.parse.pdf.v1`, from the
 parser-protos commit this build pins). Apache-2.0, engine included:
 this is the standard PDF backend of the parsing fleet.
 

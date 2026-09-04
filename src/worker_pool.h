@@ -10,7 +10,7 @@
 
 #include <grpcpp/grpcpp.h>
 
-#include "ai/pipestream/parse/pdf/v1/pdf_backend_service.grpc.pb.h"
+#include "ai/protomolt/parse/pdf/v1/pdf_backend_service.grpc.pb.h"
 
 namespace grpc_pdfium {
 
@@ -23,7 +23,7 @@ class WorkerPool {
  public:
   struct Lease {
     int index = -1;
-    ai::pipestream::parse::pdf::v1::PdfBackendService::Stub* stub = nullptr;
+    ai::protomolt::parse::pdf::v1::PdfBackendService::Stub* stub = nullptr;
   };
 
   // Spawns size workers running self_exe --worker <socket>. Sockets live
@@ -43,7 +43,7 @@ class WorkerPool {
     pid_t pid = -1;
     std::string socket_path;
     std::shared_ptr<grpc::Channel> channel;
-    std::unique_ptr<ai::pipestream::parse::pdf::v1::PdfBackendService::Stub>
+    std::unique_ptr<ai::protomolt::parse::pdf::v1::PdfBackendService::Stub>
         stub;
     bool busy = false;
   };

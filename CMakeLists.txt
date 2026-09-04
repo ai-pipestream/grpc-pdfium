@@ -26,26 +26,26 @@ FetchContent_Declare(grpc
 FetchContent_MakeAvailable(grpc)
 
 # ---------------------------------------------------------------------------
-# The PdfBackendService contract (package ai.pipestream.parse.pdf.v1),
+# The PdfBackendService contract (package ai.protomolt.parse.pdf.v1),
 # fetched from the parser-protos repo at a pinned commit; gRParse backends/
 # holds the same bytes. -DPDF_PROTO_LOCAL_DIR=<directory holding the .proto
 # files> overrides for contract development only.
 # ---------------------------------------------------------------------------
-set(PDF_PROTOS_COMMIT "516f8042b5ea8d3dcdc150e34152148e7cc1bbc8"
+set(PDF_PROTOS_COMMIT "fba7556c073dba4f907a94841c358424c6786962"
     CACHE STRING "parser-protos commit the contract comes from")
 set(PDF_PROTOS_BASE_URL
-    "https://git.rokkon.com/ai-pipestream/parser-protos/raw/commit/${PDF_PROTOS_COMMIT}/proto/ai/pipestream/parse/pdf/v1"
+    "https://git.rokkon.com/ai-pipestream/parser-protos/raw/commit/${PDF_PROTOS_COMMIT}/proto/ai/protomolt/parse/pdf/v1"
     CACHE STRING "base URL the contract proto files are downloaded from")
 set(PDF_PROTO_TYPES_SHA256
-    "617356676c2a2937e4388c8791b0b446474e72bc8de4da800fd965f6912a00d6"
+    "86c4bc05e92e640d2defdfac861cf9cea747da3cb38268f933380a4f76bb0fda"
     CACHE STRING "sha256 of pdf_backend_types.proto")
 set(PDF_PROTO_SERVICE_SHA256
-    "f941899cc2e2b6f29736262d30ebd259fd313dd7cdd1f30ea92e259e9c7d5f27"
+    "b50b551beb869af100860c6be1bca8832fff27622be0a6f882fb347e72792a98"
     CACHE STRING "sha256 of pdf_backend_service.proto")
 set(PDF_PROTO_LOCAL_DIR "" CACHE PATH "directory holding the contract protos, instead of the pinned download")
 
 set(STAGED_PROTO_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto")
-set(PDF_PROTO_REL "ai/pipestream/parse/pdf/v1")
+set(PDF_PROTO_REL "ai/protomolt/parse/pdf/v1")
 
 if(PDF_PROTO_LOCAL_DIR)
   set(PDF_PROTO_SRC "${PDF_PROTO_LOCAL_DIR}")
