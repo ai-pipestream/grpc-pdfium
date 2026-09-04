@@ -93,6 +93,26 @@ int main(int argc, char** argv) {
           "non-PDF bytes report LOAD_STATUS_NOT_PDF");
   }
 
+  // GetServiceInfo: the document-independent identity, with the family UiInfo
+  // block. backend_name and engine_version match what Probe reports.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::ServiceInfoRequest request;
+    pdfv1::ServiceInfoResponse response;
+    grpc::Status status = stub->GetServiceInfo(&ctx, request, &response);
+    Check(status.ok(), "GetServiceInfo RPC succeeded");
+    Check(response.backend_name() == "grpc-pdfium",
+          "service info reports the backend name");
+    Check(response.engine_version() == "pdfium 154.0.8035.0 (chromium/8035)",
+          "service info reports the engine version");
+    Check(!response.build_version().empty(),
+          "service info reports a build version");
+    Check(response.ui().title() == "PDFium", "service info carries UiInfo");
+    Check(response.ui().path() == "/ui/pdfium", "UiInfo mounts under /ui");
+    Check(!response.ui().description().empty(),
+          "UiInfo carries a description");
+  }
+
   // Parse the fixture: header with inventory, a font table entry, the text
   // cell, and trailer counts.
   {

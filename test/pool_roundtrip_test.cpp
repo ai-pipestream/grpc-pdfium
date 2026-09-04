@@ -99,6 +99,26 @@ int main(int argc, char** argv) {
             "pool Probe loads the fixture");
     }
 
+    // GetServiceInfo is answered by the front itself, no worker round-trip.
+    {
+      grpc::ClientContext ctx;
+      pdfv1::ServiceInfoRequest request;
+      pdfv1::ServiceInfoResponse response;
+      grpc::Status status = stub->GetServiceInfo(&ctx, request, &response);
+      Check(status.ok(), "GetServiceInfo through the front succeeded");
+      Check(response.backend_name() == "grpc-pdfium",
+            "front service info reports the backend name");
+      Check(response.engine_version() ==
+                "pdfium 154.0.8035.0 (chromium/8035)",
+            "front service info reports the engine version");
+      Check(!response.build_version().empty(),
+            "front service info reports a build version");
+      Check(response.ui().title() == "PDFium" &&
+                response.ui().path() == "/ui/pdfium" &&
+                !response.ui().description().empty(),
+            "front service info carries the UiInfo block");
+    }
+
     {
       grpc::ClientContext ctx;
       pdfv1::ParseRequest request;

@@ -49,8 +49,9 @@ std::string SelfExe() {
 
 int RunFront() {
   const char* port_env = std::getenv("GRPC_PDFIUM_PORT");
+  // Fleet default port 50069 (the old 50051 collides with gRParse).
   const std::string address =
-      std::string("0.0.0.0:") + (port_env != nullptr ? port_env : "50051");
+      std::string("0.0.0.0:") + (port_env != nullptr ? port_env : "50069");
 
   int pool_size = 4;
   if (const char* workers_env = std::getenv("GRPC_PDFIUM_WORKERS")) {

@@ -40,6 +40,13 @@ class ProxyServiceImpl final
       grpc::ServerWriter<ai::protomolt::parse::pdf::v1::RenderResponse>*
           writer) override;
 
+  // Answered by the front itself: the identity is the same for front and
+  // workers, so no worker round-trip is needed (and no worker is leased).
+  grpc::Status GetServiceInfo(
+      grpc::ServerContext* context,
+      const ai::protomolt::parse::pdf::v1::ServiceInfoRequest* request,
+      ai::protomolt::parse::pdf::v1::ServiceInfoResponse* response) override;
+
  private:
   WorkerPool* pool_;
   ByteCache* cache_;

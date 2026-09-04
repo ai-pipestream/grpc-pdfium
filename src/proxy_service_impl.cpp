@@ -4,6 +4,7 @@
 #include <string>
 
 #include "pdfium_engine.h"
+#include "service_info.h"
 #include "sha256.h"
 
 namespace grpc_pdfium {
@@ -191,6 +192,14 @@ grpc::Status ProxyServiceImpl::Render(grpc::ServerContext* /*context*/,
       pool_, resolved, writer,
       [](pdfv1::PdfBackendService::Stub* stub, grpc::ClientContext* ctx,
          const pdfv1::RenderRequest& req) { return stub->Render(ctx, req); });
+}
+
+grpc::Status ProxyServiceImpl::GetServiceInfo(
+    grpc::ServerContext* /*context*/,
+    const pdfv1::ServiceInfoRequest* /*request*/,
+    pdfv1::ServiceInfoResponse* response) {
+  FillServiceInfo(response);
+  return grpc::Status::OK;
 }
 
 }  // namespace grpc_pdfium

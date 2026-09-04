@@ -55,8 +55,27 @@ cmake -S . -B build -DPDF_PROTO_LOCAL_DIR=/path/to/gRParse/backends
 ## Run
 
 ```bash
-GRPC_PDFIUM_PORT=50051 ./build/grpc_pdfium
+./build/grpc_pdfium           # listens on 0.0.0.0:50069 (fleet default)
+GRPC_PDFIUM_PORT=50100 ./build/grpc_pdfium   # env override
 ```
 
-Health and server reflection are enabled; `Probe`, `Parse`, and `Render`
-are the service surface.
+Health and server reflection are enabled; `Probe`, `Parse`, `Render`, and
+`GetServiceInfo` are the service surface. `GetServiceInfo` reports the
+backend identity (`backend_name` and `engine_version` are the same strings
+`Probe` reports), the build version (the image tag in Docker builds, a
+`git describe` fallback locally), and the family `UiInfo` block for the
+demo shell (no web UI yet; the description says so).
+
+## Docker
+
+```bash
+docker build -t grpc-pdfium .
+docker run --rm --tmpfs /tmp -p 50069:50069 grpc-pdfium
+```
+
+The build stage runs the test suite and the tests gate the image. The
+runtime carries the one executable (front and worker in a single binary)
+plus the PDFium shared library. Pushes to `main` republish
+`docker.io/pipestreamai/grpc-pdfium:latest` (amd64 only, like the rest of
+the family's C++ services); a manual `workflow_dispatch` with a version
+input also tags that version and stamps it as the build version.

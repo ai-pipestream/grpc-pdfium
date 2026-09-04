@@ -3,6 +3,7 @@
 #include <mutex>
 
 #include "pdfium_engine.h"
+#include "service_info.h"
 
 namespace grpc_pdfium {
 
@@ -57,6 +58,14 @@ grpc::Status PdfBackendServiceImpl::Render(
                                 : grpc::StatusCode::FAILED_PRECONDITION;
     return grpc::Status(code, error);
   }
+  return grpc::Status::OK;
+}
+
+grpc::Status PdfBackendServiceImpl::GetServiceInfo(
+    grpc::ServerContext* /*context*/,
+    const pdfv1::ServiceInfoRequest* /*request*/,
+    pdfv1::ServiceInfoResponse* response) {
+  FillServiceInfo(response);
   return grpc::Status::OK;
 }
 

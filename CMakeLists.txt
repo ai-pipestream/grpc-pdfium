@@ -11,6 +11,30 @@ add_library(grpc_pdfium_flags INTERFACE)
 target_compile_options(grpc_pdfium_flags INTERFACE -Wall -Wextra)
 
 # ---------------------------------------------------------------------------
+# The build version GetServiceInfo reports. Docker builds pass the image tag
+# with -DGRPC_PDFIUM_BUILD_VERSION=..., local builds fall back to
+# git describe, then "dev".
+# ---------------------------------------------------------------------------
+set(GRPC_PDFIUM_BUILD_VERSION "" CACHE STRING
+    "build version GetServiceInfo reports (the image tag in Docker builds)")
+if(GRPC_PDFIUM_BUILD_VERSION STREQUAL "")
+  find_package(Git QUIET)
+  if(Git_FOUND)
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" describe --tags --always --dirty
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      OUTPUT_VARIABLE GRPC_PDFIUM_BUILD_VERSION
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+  endif()
+endif()
+if(GRPC_PDFIUM_BUILD_VERSION STREQUAL "")
+  set(GRPC_PDFIUM_BUILD_VERSION "dev")
+endif()
+target_compile_definitions(grpc_pdfium_flags INTERFACE
+  GRPC_PDFIUM_BUILD_VERSION="${GRPC_PDFIUM_BUILD_VERSION}")
+
+# ---------------------------------------------------------------------------
 # gRPC + protobuf, the fleet's C++ pattern (same tag as gRParse).
 # ---------------------------------------------------------------------------
 set(gRPC_INSTALL OFF CACHE BOOL "" FORCE)
@@ -31,7 +55,7 @@ FetchContent_MakeAvailable(grpc)
 # holds the same bytes. -DPDF_PROTO_LOCAL_DIR=<directory holding the .proto
 # files> overrides for contract development only.
 # ---------------------------------------------------------------------------
-set(PDF_PROTOS_COMMIT "4d72ec2c4550f8110ba03550f659c931d57e024d"
+set(PDF_PROTOS_COMMIT "f1ddf559b40a21a57e87d21810c70fa20512ed1b"
     CACHE STRING "parser-protos commit the contract comes from")
 set(PDF_PROTOS_BASE_URL
     "https://git.rokkon.com/ai-pipestream/parser-protos/raw/commit/${PDF_PROTOS_COMMIT}/proto/ai/protomolt/parse/pdf/v1"
@@ -40,7 +64,7 @@ set(PDF_PROTO_TYPES_SHA256
     "5570baad185a6f008976c8f013a48382b04c83b54a60ccdf94b0cd0a65bf2cce"
     CACHE STRING "sha256 of pdf_backend_types.proto")
 set(PDF_PROTO_SERVICE_SHA256
-    "ae8ae5bb765e771b98176501ffc59583bf0c0428b7aa45e37e011f1e02aeeecd"
+    "f0d47132b48af9cf09007afac32b26ef8f8e521b16f7bc105780d6afef5e4e8a"
     CACHE STRING "sha256 of pdf_backend_service.proto")
 set(PDF_PROTO_LOCAL_DIR "" CACHE PATH "directory holding the contract protos, instead of the pinned download")
 
