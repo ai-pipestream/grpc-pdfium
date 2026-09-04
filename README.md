@@ -2,7 +2,7 @@
 
 A gRPC PDF backend service around PDFium, implementing the fleet's common
 `PdfBackendService` contract (`ai.pipestream.parse.pdf.v1`, from the
-pipestream-protos release this build pins). Apache-2.0, engine included:
+parser-protos commit this build pins). Apache-2.0, engine included:
 this is the standard PDF backend of the parsing fleet.
 
 Status: tiers 0-2. The engine is the sha256-pinned PDFium prebuilt
@@ -31,12 +31,12 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-The contract protos come from the pinned pipestream-protos release tarball
+The contract protos come from the pinned parser-protos commit
 (sha256-verified download at configure time). To develop against a local
-contract instead:
+contract instead, point at a directory holding the two proto files:
 
 ```bash
-cmake -S . -B build -DPDF_PROTO_LOCAL_DIR=/path/to/pipestream-protos
+cmake -S . -B build -DPDF_PROTO_LOCAL_DIR=/path/to/gRParse/backends
 ```
 
 ## Run

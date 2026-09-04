@@ -26,39 +26,48 @@ FetchContent_Declare(grpc
 FetchContent_MakeAvailable(grpc)
 
 # ---------------------------------------------------------------------------
-# The PdfBackendService contract, consumed from the pipestream-protos release
-# (the ai.pipestream.parse.pdf.v1 package). The pinned release tarball is the
-# default; -DPDF_PROTO_LOCAL_DIR=<pipestream-protos checkout> overrides it for
-# contract development only.
+# The PdfBackendService contract (package ai.pipestream.parse.pdf.v1),
+# fetched from the parser-protos repo at a pinned commit; gRParse backends/
+# holds the same bytes. -DPDF_PROTO_LOCAL_DIR=<directory holding the .proto
+# files> overrides for contract development only.
 # ---------------------------------------------------------------------------
-set(PDF_PROTOS_VERSION "0.15.0" CACHE STRING "pipestream-protos release the contract comes from")
-set(PDF_PROTOS_SHA256 "558974e94c148b351f7dce74ac1189bd41e0433d5fa104cffa21c82c62c6db9b"
-    CACHE STRING "sha256 of the release proto tarball")
-set(PDF_PROTOS_URL
-    "https://git.rokkon.com/api/packages/ai-pipestream/generic/pipestream-protos/${PDF_PROTOS_VERSION}/pipestream-protos-${PDF_PROTOS_VERSION}.tgz"
-    CACHE STRING "URL of the release proto tarball")
-set(PDF_PROTO_LOCAL_DIR "" CACHE PATH "local pipestream-protos checkout to use instead of the release tarball")
+set(PDF_PROTOS_COMMIT "516f8042b5ea8d3dcdc150e34152148e7cc1bbc8"
+    CACHE STRING "parser-protos commit the contract comes from")
+set(PDF_PROTOS_BASE_URL
+    "https://git.rokkon.com/ai-pipestream/parser-protos/raw/commit/${PDF_PROTOS_COMMIT}/proto/ai/pipestream/parse/pdf/v1"
+    CACHE STRING "base URL the contract proto files are downloaded from")
+set(PDF_PROTO_TYPES_SHA256
+    "617356676c2a2937e4388c8791b0b446474e72bc8de4da800fd965f6912a00d6"
+    CACHE STRING "sha256 of pdf_backend_types.proto")
+set(PDF_PROTO_SERVICE_SHA256
+    "f941899cc2e2b6f29736262d30ebd259fd313dd7cdd1f30ea92e259e9c7d5f27"
+    CACHE STRING "sha256 of pdf_backend_service.proto")
+set(PDF_PROTO_LOCAL_DIR "" CACHE PATH "directory holding the contract protos, instead of the pinned download")
 
 set(STAGED_PROTO_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto")
 set(PDF_PROTO_REL "ai/pipestream/parse/pdf/v1")
 
 if(PDF_PROTO_LOCAL_DIR)
-  set(PDF_PROTO_SRC "${PDF_PROTO_LOCAL_DIR}/pdf-backend/proto/${PDF_PROTO_REL}")
+  set(PDF_PROTO_SRC "${PDF_PROTO_LOCAL_DIR}")
 else()
-  set(PROTOS_TGZ "${CMAKE_CURRENT_BINARY_DIR}/pipestream-protos-${PDF_PROTOS_VERSION}.tgz")
-  if(NOT EXISTS "${PROTOS_TGZ}")
-    file(DOWNLOAD "${PDF_PROTOS_URL}" "${PROTOS_TGZ}"
-      EXPECTED_HASH SHA256=${PDF_PROTOS_SHA256}
-      STATUS PROTOS_DL_STATUS)
-    list(GET PROTOS_DL_STATUS 0 PROTOS_DL_CODE)
-    if(NOT PROTOS_DL_CODE EQUAL 0)
-      file(REMOVE "${PROTOS_TGZ}")
-      message(FATAL_ERROR "proto tarball download failed: ${PROTOS_DL_STATUS}")
+  set(PDF_PROTO_SRC "${CMAKE_CURRENT_BINARY_DIR}/protos-export/${PDF_PROTOS_COMMIT}")
+  foreach(PROTO_SPEC IN ITEMS
+      "pdf_backend_types.proto;${PDF_PROTO_TYPES_SHA256}"
+      "pdf_backend_service.proto;${PDF_PROTO_SERVICE_SHA256}")
+    list(GET PROTO_SPEC 0 PROTO_NAME)
+    list(GET PROTO_SPEC 1 PROTO_SHA)
+    if(NOT EXISTS "${PDF_PROTO_SRC}/${PROTO_NAME}")
+      file(DOWNLOAD "${PDF_PROTOS_BASE_URL}/${PROTO_NAME}"
+        "${PDF_PROTO_SRC}/${PROTO_NAME}"
+        EXPECTED_HASH SHA256=${PROTO_SHA}
+        STATUS PROTO_DL_STATUS)
+      list(GET PROTO_DL_STATUS 0 PROTO_DL_CODE)
+      if(NOT PROTO_DL_CODE EQUAL 0)
+        file(REMOVE "${PDF_PROTO_SRC}/${PROTO_NAME}")
+        message(FATAL_ERROR "contract proto download failed: ${PROTO_DL_STATUS}")
+      endif()
     endif()
-  endif()
-  set(PROTOS_EXPORT "${CMAKE_CURRENT_BINARY_DIR}/protos-export")
-  file(ARCHIVE_EXTRACT INPUT "${PROTOS_TGZ}" DESTINATION "${PROTOS_EXPORT}")
-  set(PDF_PROTO_SRC "${PROTOS_EXPORT}/pdf-backend/proto/${PDF_PROTO_REL}")
+  endforeach()
 endif()
 
 file(MAKE_DIRECTORY "${STAGED_PROTO_DIR}/${PDF_PROTO_REL}")
