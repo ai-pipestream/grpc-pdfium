@@ -54,11 +54,14 @@ FetchContent_MakeAvailable(grpc)
 # fetched from the parser-protos repo at a pinned commit; gRParse backends/
 # holds the same bytes. -DPDF_PROTO_LOCAL_DIR=<directory holding the .proto
 # files> overrides for contract development only.
+# The download comes from the GitHub mirror's raw URL, not git.rokkon.com:
+# GitHub-hosted runners cannot resolve the Forgejo host, and the per-file
+# sha256 pins below verify the bytes either way.
 # ---------------------------------------------------------------------------
 set(PDF_PROTOS_COMMIT "f1ddf559b40a21a57e87d21810c70fa20512ed1b"
     CACHE STRING "parser-protos commit the contract comes from")
 set(PDF_PROTOS_BASE_URL
-    "https://git.rokkon.com/ai-pipestream/parser-protos/raw/commit/${PDF_PROTOS_COMMIT}/proto/ai/protomolt/parse/pdf/v1"
+    "https://raw.githubusercontent.com/ai-pipestream/parser-protos/${PDF_PROTOS_COMMIT}/proto/ai/protomolt/parse/pdf/v1"
     CACHE STRING "base URL the contract proto files are downloaded from")
 set(PDF_PROTO_TYPES_SHA256
     "5570baad185a6f008976c8f013a48382b04c83b54a60ccdf94b0cd0a65bf2cce"
