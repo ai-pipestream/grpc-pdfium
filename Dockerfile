@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.26
+# syntax=docker/dockerfile:1.27
 # grpc-pdfium, amd64-only like the rest of the family's C++ services.
 #
 # The build stage compiles the service and runs the test suite; the tests
