@@ -99,6 +99,8 @@ dynamic loader reports it, since the base has no `ldd`), the front reaches
 its "listening on" line under `--read-only --tmpfs /tmp --cap-drop ALL`,
 every process runs as uid 65532, and the worker pool is spawned in full.
 Pushes to `main` republish `docker.io/pipestreamai/grpc-pdfium:latest`
-(amd64 only, like the rest of the family's C++ services); a manual
-`workflow_dispatch` with a version input also tags that version and stamps
-it as the build version.
+as a linux/amd64 + linux/arm64 manifest list (the arm64 leg builds
+natively on GitHub's hosted arm64 runner; each leg boot-proofs its own
+pushed digest before the tag is assembled); a manual `workflow_dispatch`
+with a version input also tags that version and stamps it as the build
+version.

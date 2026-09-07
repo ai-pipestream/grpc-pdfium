@@ -11,7 +11,13 @@ on:
 
 jobs:
   image:
-    runs-on: ubuntu-latest
+    name: image ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    # Both architectures the publish workflow ships, each built natively.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v4
       # The image build runs the test suite itself, so this also proves the
