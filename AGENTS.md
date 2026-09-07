@@ -40,9 +40,19 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   the image tag, local builds fall back to `git describe`, then "dev"),
   and the `UiInfo` block follows the family convention (no web UI yet; the
   description says so).
-- The Docker image is multi-stage: the build stage runs the ctest suite as
-  a gate, the runtime carries the binary plus the PDFium shared library.
-  `.github/workflows/publish.yml` republishes
-  `docker.io/pipestreamai/grpc-pdfium:latest` on push to `main` (amd64
-  only; Docker Hub auth via the `DOCKER_USER`/`DOCKER_TOKEN` org secrets),
-  and `ci.yml` runs the image build on push/PR.
+- The Docker image is multi-stage: the build stage (Debian trixie
+  toolchain) runs the ctest suite as a gate; the runtime is the hardened
+  `dhi.io/debian-base:trixie-debian13` base (glibc only, no package
+  manager, no ldconfig, uid 65532) carrying the binary plus the staged
+  shared-library closure (`scripts/stage-runtime-libs.sh`, PDFium
+  included) under `/usr/local/lib` on `LD_LIBRARY_PATH`. The build stage
+  must stay on a glibc no newer than the runtime base's (2.41); a build on
+  ubuntu 26.04 produces a binary the base cannot load.
+  `GRPC_PDFIUM_RUNTIME_IMAGE` swaps the base. A read-only container needs
+  `--tmpfs /tmp` for the worker sockets. `scripts/smoke-test.sh IMAGE` is
+  the boot gate (closure, boot to listening under the hardened flags, uid,
+  worker count); `ci.yml` runs the image build then the smoke test on
+  push/PR, and `.github/workflows/publish.yml` builds, smoke-tests, and
+  only then pushes `docker.io/pipestreamai/grpc-pdfium:latest` on push to
+  `main` (amd64 only; Docker Hub auth via the `DOCKER_USER`/`DOCKER_TOKEN`
+  org secrets).

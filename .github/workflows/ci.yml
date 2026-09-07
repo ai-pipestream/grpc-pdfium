@@ -1,6 +1,6 @@
 # CI gates for grpc-pdfium: the image build compiles the service and runs
 # the ctest suite, so a green run here and a green local image build mean
-# the same thing.
+# the same thing; the smoke test then boot-proofs the runtime image.
 name: ci
 
 on:
@@ -18,3 +18,7 @@ jobs:
       # tests pass in a clean container with no host toolchain state.
       - name: docker build
         run: docker build -t grpc-pdfium:ci .
+      # Library closure, boot to listening under the hardened run flags,
+      # uid 65532, and the worker pool spawned in full.
+      - name: Boot-proof the runtime image
+        run: ./scripts/smoke-test.sh grpc-pdfium:ci

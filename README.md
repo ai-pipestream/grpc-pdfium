@@ -70,12 +70,35 @@ demo shell (no web UI yet; the description says so).
 
 ```bash
 docker build -t grpc-pdfium .
-docker run --rm --tmpfs /tmp -p 50069:50069 grpc-pdfium
+docker run --rm --read-only --tmpfs /tmp -p 50069:50069 grpc-pdfium
+scripts/smoke-test.sh grpc-pdfium     # boot-proof a built image
 ```
 
-The build stage runs the test suite and the tests gate the image. The
-runtime carries the one executable (front and worker in a single binary)
-plus the PDFium shared library. Pushes to `main` republish
-`docker.io/pipestreamai/grpc-pdfium:latest` (amd64 only, like the rest of
-the family's C++ services); a manual `workflow_dispatch` with a version
-input also tags that version and stamps it as the build version.
+The build stage (a Debian trixie toolchain) runs the test suite and the
+tests gate the image. The runtime stage is the hardened
+`dhi.io/debian-base:trixie-debian13` base: glibc and nothing else, no
+package manager, no ldconfig, and the service runs as uid 65532 out of the
+box, so no `--user` flag is needed. It carries the one executable (front and
+worker in a single binary) plus the shared libraries it needs beyond glibc
+(the PDFium engine, libstdc++, libgcc_s), staged from the build stage into
+`/usr/local/lib` and found through `LD_LIBRARY_PATH`;
+`scripts/stage-runtime-libs.sh` copies that closure at build time and
+fails the build if anything would resolve from outside it. The base is
+swappable with `--build-arg GRPC_PDFIUM_RUNTIME_IMAGE=<image>` for any
+image whose glibc is 2.41 or newer.
+
+The container runs read-only with one requirement: the front spawns its
+workers itself and needs a writable `/tmp` for their unix sockets, so
+`--read-only` must come with `--tmpfs /tmp` (a compose service needs a
+`tmpfs: [/tmp]` entry beside `read_only: true`). Without it the front exits
+at startup with "failed to create the worker socket directory".
+
+`scripts/smoke-test.sh IMAGE` is the boot gate CI and the publish workflow
+run before any push: the library closure resolves inside the image (the
+dynamic loader reports it, since the base has no `ldd`), the front reaches
+its "listening on" line under `--read-only --tmpfs /tmp --cap-drop ALL`,
+every process runs as uid 65532, and the worker pool is spawned in full.
+Pushes to `main` republish `docker.io/pipestreamai/grpc-pdfium:latest`
+(amd64 only, like the rest of the family's C++ services); a manual
+`workflow_dispatch` with a version input also tags that version and stamps
+it as the build version.
