@@ -1,10 +1,11 @@
 name: Publish Images
 
-# Builds the service image and pushes it to docker.io/pipestreamai. Every
-# push to main republishes :latest; a manual dispatch with a version input
-# also tags that version and stamps it as the build_version GetServiceInfo
-# reports. Docker Hub credentials come from the DOCKER_USER / DOCKER_TOKEN
-# org secrets.
+# Builds the service image (the build stage runs the test suite), boot-proofs
+# the runtime stage with scripts/smoke-test.sh, and only then pushes it to
+# docker.io/pipestreamai. Every push to main republishes :latest; a manual
+# dispatch with a version input also tags that version and stamps it as the
+# build_version GetServiceInfo reports. Docker Hub credentials come from the
+# DOCKER_USER / DOCKER_TOKEN org secrets.
 #
 # amd64-only, like the rest of the family's C++ services: emulated arm64 C++
 # builds are too slow, so that leg waits on native arm64 runners.
@@ -33,24 +34,37 @@ jobs:
           password: ${{ secrets.DOCKER_TOKEN }}
       - name: Compute tags and build version
         id: tags
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
+          set -euo pipefail
           tags="docker.io/pipestreamai/grpc-pdfium:latest"
-          version="${{ inputs.version }}"
+          version="$VERSION"
           if [ -n "$version" ]; then
             tags="$tags,docker.io/pipestreamai/grpc-pdfium:$version"
           else
             version="latest"
           fi
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Build and push the service image
+          {
+            echo "tags=$tags"
+            echo "push_tags=$(tr ',' ' ' <<<"$tags")"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build the service image (runs the test suite in the build stage)
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
-          push: true
+          load: true
           provenance: false
           sbom: false
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             GRPC_PDFIUM_BUILD_VERSION=${{ steps.tags.outputs.version }}
+      - name: Boot-proof the image before any push
+        run: ./scripts/smoke-test.sh docker.io/pipestreamai/grpc-pdfium:latest
+      - name: Push all tags
+        run: |
+          for tag in ${{ steps.tags.outputs.push_tags }}; do
+            docker push "$tag"
+          done
