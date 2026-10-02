@@ -460,9 +460,24 @@ void FillFormFields(FPDF_FORMHANDLE handle, FPDF_PAGE page,
     if (!v.empty()) field->set_value(v);
     std::string alt = str(FPDFAnnot_GetFormFieldAlternateName);
     if (!alt.empty()) field->set_alternate_name(alt);
+    // PDFium resolves /Ff through the field's /Parent chain, so the flags
+    // are the inherited mask docling-core reports as widget_field_flags.
+    // -1 is PDFium's failure answer, not a mask.
     int flags = FPDFAnnot_GetFormFieldFlags(handle, annot);
-    field->set_flags(static_cast<uint32_t>(flags));
-    field->set_read_only(flags & 1);
+    if (flags >= 0) {
+      field->set_flags(static_cast<uint32_t>(flags));
+      field->set_read_only((flags & 1) != 0);
+    }
+    // /AS lives on the widget annotation itself and is never inherited.
+    // PDFium answers a name with its decoded text; the contract keeps the
+    // PDF spelling with the leading slash.
+    if (FPDFAnnot_GetValueType(annot, "AS") == FPDF_OBJECT_NAME) {
+      std::string state = Utf16Field([annot](void* buf, unsigned long len) {
+        return FPDFAnnot_GetStringValue(annot, "AS",
+                                        static_cast<FPDF_WCHAR*>(buf), len);
+      });
+      field->set_appearance_state("/" + state);
+    }
     int options = FPDFAnnot_GetOptionCount(handle, annot);
     for (int o = 0; o < options; ++o) {
       field->add_options(Utf16Field([handle, annot, o](void* buf,
@@ -794,6 +809,7 @@ DocFacts GatherDocFacts(FPDF_DOCUMENT doc) {
   facts.signature_count = FPDF_GetSignatureCount(doc);
   facts.javascript_count = FPDFDoc_GetJavaScriptActionCount(doc);
   facts.attachment_count = FPDFDoc_GetAttachmentCount(doc);
+  facts.has_form = FPDF_GetFormType(doc) != FORMTYPE_NONE;
   return facts;
 }
 

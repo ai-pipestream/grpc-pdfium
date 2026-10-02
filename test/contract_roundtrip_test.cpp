@@ -79,6 +79,14 @@ int main(int argc, char** argv) {
       }
     }
     Check(text_supported, "text cells are a supported family");
+    bool forms_absent = false;
+    for (const auto& f : caps.families()) {
+      if (f.family() == pdfv1::PDF_FAMILY_FORM_FIELDS &&
+          f.support() == pdfv1::FAMILY_SUPPORT_ABSENT_IN_DOCUMENT) {
+        forms_absent = true;
+      }
+    }
+    Check(forms_absent, "a document without an AcroForm declares no widgets");
   }
 
   // Probe non-PDF bytes: typed NOT_PDF.

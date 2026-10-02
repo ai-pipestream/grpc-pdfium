@@ -26,6 +26,8 @@ struct DocFacts {
   int signature_count = 0;
   int javascript_count = 0;
   int attachment_count = 0;
+  // The catalog names an interactive form (/AcroForm or XFA).
+  bool has_form = false;
 };
 
 DocFacts GatherDocFacts(FPDF_DOCUMENT doc);
