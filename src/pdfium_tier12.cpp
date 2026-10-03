@@ -114,7 +114,9 @@ std::string Utf16Field(
   return out;
 }
 
-// Byte-string variant for ASCII-ish two-call APIs (URI paths, dates).
+// Byte-string variant for the two-call APIs that hand back raw PDF bytes
+// (names, URI paths, dates). The bytes come back as stored and need not be
+// UTF-8; whatever goes into a proto string field goes through ValidUtf8.
 std::string ByteField(
     const std::function<unsigned long(void*, unsigned long)>& fetch) {
   unsigned long len = fetch(nullptr, 0);
@@ -248,9 +250,10 @@ void FillOutline(FPDF_DOCUMENT doc, FPDF_BOOKMARK bookmark,
   } else if (FPDF_ACTION action = FPDFBookmark_GetAction(bookmark)) {
     unsigned long type = FPDFAction_GetType(action);
     if (type == PDFACTION_URI) {
-      node->set_uri(ByteField([doc, action](void* buf, unsigned long len) {
+      node->set_uri(ValidUtf8(ByteField([doc, action](void* buf,
+                                                      unsigned long len) {
         return FPDFAction_GetURIPath(doc, action, buf, len);
-      }));
+      })));
     } else if (type == PDFACTION_GOTO) {
       if (FPDF_DEST action_dest = FPDFAction_GetDest(doc, action)) {
         FillDestination(doc, action_dest, node->mutable_destination());
@@ -332,7 +335,7 @@ void FillSignatures(FPDF_DOCUMENT doc, pdfv1::SignatureChunk* chunk) {
     std::string sub_filter = ByteField([sig](void* buf, unsigned long len) {
       return FPDFSignatureObj_GetSubFilter(sig, static_cast<char*>(buf), len);
     });
-    if (!sub_filter.empty()) info->set_sub_filter(sub_filter);
+    if (!sub_filter.empty()) info->set_sub_filter(ValidUtf8(sub_filter));
     std::string reason = Utf16Field([sig](void* buf, unsigned long len) {
       return FPDFSignatureObj_GetReason(sig, buf, len);
     });
@@ -340,7 +343,7 @@ void FillSignatures(FPDF_DOCUMENT doc, pdfv1::SignatureChunk* chunk) {
     std::string time = ByteField([sig](void* buf, unsigned long len) {
       return FPDFSignatureObj_GetTime(sig, static_cast<char*>(buf), len);
     });
-    if (!time.empty()) info->set_signing_time_raw(time);
+    if (!time.empty()) info->set_signing_time_raw(ValidUtf8(time));
     unsigned int mdp = FPDFSignatureObj_GetDocMDPPermission(sig);
     if (mdp > 0) info->set_doc_mdp_permission(mdp);
     unsigned long blob = FPDFSignatureObj_GetContents(sig, nullptr, 0);
@@ -395,9 +398,10 @@ void FillHyperlinks(FPDF_DOCUMENT doc, FPDF_PAGE page, pdfv1::PageChunk* chunk) 
     if (FPDF_ACTION action = FPDFLink_GetAction(link)) {
       unsigned long type = FPDFAction_GetType(action);
       if (type == PDFACTION_URI) {
-        out.set_uri(ByteField([doc, action](void* buf, unsigned long len) {
+        out.set_uri(ValidUtf8(ByteField([doc, action](void* buf,
+                                                      unsigned long len) {
           return FPDFAction_GetURIPath(doc, action, buf, len);
-        }));
+        })));
         typed = true;
       } else if (type == PDFACTION_GOTO) {
         if (FPDF_DEST dest = FPDFAction_GetDest(doc, action)) {

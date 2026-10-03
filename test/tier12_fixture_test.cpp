@@ -3,8 +3,9 @@
 // signed.pdf the signature field, the encrypted pair the encryption info
 // and the password load statuses, page-tree.pdf the page geometry a page
 // inherits through the page tree, form-xobject.pdf content nested in Form
-// XObjects and invisible text, huge-image.pdf the image decode limit, and
-// font-names.pdf font names that are not valid UTF-8.
+// XObjects and invisible text, huge-image.pdf the image decode limit,
+// font-names.pdf font names that are not valid UTF-8, and
+// legacy-strings.pdf the other raw byte strings (URIs, signature fields).
 
 #include <algorithm>
 #include <chrono>
@@ -144,9 +145,11 @@ int main(int argc, char** argv) {
   const std::string form_xobject = ReadFile(dir + "/form-xobject.pdf");
   const std::string huge_image = ReadFile(dir + "/huge-image.pdf");
   const std::string font_names = ReadFile(dir + "/font-names.pdf");
+  const std::string legacy_strings = ReadFile(dir + "/legacy-strings.pdf");
   Check(!rich.empty() && !signed_doc.empty() && !enc_open.empty() &&
             !enc_locked.empty() && !page_tree.empty() && !form_xobject.empty() &&
-            !huge_image.empty() && !font_names.empty(),
+            !huge_image.empty() && !font_names.empty() &&
+            !legacy_strings.empty(),
         "fixtures read");
 
   // ValidUtf8: well-formed UTF-8 passes through; each byte of an
@@ -253,6 +256,43 @@ int main(int argc, char** argv) {
           "GBK base font name arrives as Latin-1 UTF-8");
     Check(has("\xE5\xAE\x8B\xE4\xBD\x93"),
           "UTF-8 base font name arrives unchanged");
+  }
+
+  // legacy-strings.pdf: the other byte strings PDFium hands back raw (a
+  // link's and an outline item's URI, a signature's /SubFilter and /M) are
+  // GBK bytes, not UTF-8. Each arrives as Latin-1 per byte, and the stream
+  // parses; the deadline turns a client stalled on a message it cannot
+  // parse into a failed check.
+  {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(30));
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_data(legacy_strings);
+    auto reader = stub->Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    pdfv1::PageChunk page;
+    pdfv1::OutlineChunk outline;
+    pdfv1::SignatureChunk signatures;
+    bool trailer = false;
+    while (reader->Read(&msg)) {
+      if (msg.has_page()) page = msg.page();
+      if (msg.has_outline()) outline = msg.outline();
+      if (msg.has_signatures()) signatures = msg.signatures();
+      if (msg.has_trailer()) trailer = true;
+    }
+    Check(reader->Finish().ok() && trailer,
+          "legacy-strings Parse stream parses to its trailer");
+    const std::string latin1 = "\xC3\x8B\xC3\x8E\xC3\x8C\xC3\xA5";
+    Check(page.hyperlinks_size() == 1 && page.hyperlinks(0).uri() == latin1,
+          "GBK link URI arrives as Latin-1 UTF-8");
+    Check(outline.roots_size() == 1 && outline.roots(0).uri() == latin1,
+          "GBK outline URI arrives as Latin-1 UTF-8");
+    Check(signatures.signatures_size() == 1 &&
+              signatures.signatures(0).sub_filter() == latin1,
+          "GBK signature sub filter arrives as Latin-1 UTF-8");
+    Check(signatures.signatures_size() == 1 &&
+              signatures.signatures(0).signing_time_raw() == latin1,
+          "GBK signing time arrives as Latin-1 UTF-8");
   }
 
   // Parse rich.pdf with heavy payloads: every claimed family delivers.
