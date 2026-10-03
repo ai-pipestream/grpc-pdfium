@@ -28,6 +28,12 @@ class PdfiumEngine {
   // Pages the engine has loaded in this process. Tests and logging only.
   static uint64_t PageLoads();
 
+  // Installs the call made for each step of work that streams no message
+  // (each page the header's inventory loads), so whoever watches this
+  // process can tell a long document from a stuck one. The worker wires it
+  // to the front's watchdog; unset, nothing is called.
+  static void SetProgressHook(std::function<void()> hook);
+
   // Loads the document and fills the per-document capability verdicts.
   static void Probe(const ai::protomolt::parse::pdf::v1::PdfDocument& document,
                     ai::protomolt::parse::pdf::v1::BackendCapabilities* caps);

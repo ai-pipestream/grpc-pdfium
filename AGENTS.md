@@ -47,7 +47,17 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   `GRPC_PDFIUM_REQUEST_TIMEOUT_S` (DEADLINE_EXCEEDED; CANCELLED when the
   front was stuck writing to a client that stopped reading). Both default to
   300 s, 0 turns one off, and a value that is not whole seconds up to a
-  week stops the start. Respawns run outside the pool lock.
+  week stops the start. Respawns run outside the pool lock. Work that
+  forwards nothing (the first-Parse page inventory) counts as progress
+  through `PdfiumEngine::SetProgressHook`: the worker sends one datagram per
+  quarter second at most on its `--progress-fd` socket pair end, and the
+  watchdog drains the front's end each tick. New long phases that stream
+  nothing must call the hook too.
+- Every byte string copied from the document into a proto `string` field
+  (`ByteField` results: URIs, signature `/SubFilter` and `/M`, font names)
+  goes through `ValidUtf8` (`src/utf8.*`); protobuf rejects invalid UTF-8
+  and the client loses the whole stream. `Utf16Field` output is already
+  valid.
   Each worker caps its own address space at
   `GRPC_PDFIUM_WORKER_MAX_BYTES` (default 3 GiB, 0 off) and disables core
   dumps (`src/main.cpp`): PDFium decodes whole streams with no size check

@@ -1,0 +1,52 @@
+%PDF-1.7
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /Outlines 8 0 R /AcroForm << /Fields [6 0 R] /SigFlags 3 >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [6 0 R 10 0 R] >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 44 >>
+stream
+BT /F1 24 Tf 100 700 Td (Byte strings) Tj ET
+endstream
+endobj
+6 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature1) /Rect [100 100 300 150] /F 4 /V 7 0 R >>
+endobj
+7 0 obj
+<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.x509.#CB#CE /Contents <DEADBEEF> /ByteRange [0 10 20 30] /M (D:20260904110000\377) >>
+endobj
+8 0 obj
+<< /Type /Outlines /First 9 0 R /Last 9 0 R /Count 1 >>
+endobj
+9 0 obj
+<< /Title (Site) /Parent 8 0 R /A << /S /URI /URI (https://example.com/\300\257) >> >>
+endobj
+10 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 650 300 690] /F 4 /A << /S /URI /URI (https://example.com/caf\351) >> >>
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000009 00000 n 
+0000000118 00000 n 
+0000000175 00000 n 
+0000000324 00000 n 
+0000000394 00000 n 
+0000000488 00000 n 
+0000000602 00000 n 
+0000000757 00000 n 
+0000000828 00000 n 
+0000000930 00000 n 
+trailer
+<< /Size 11 /Root 1 0 R >>
+startxref
+1060
+%%EOF

@@ -28,6 +28,14 @@ namespace grpc_pdfium {
 // still held a second later, the front is stuck writing to a client that
 // stopped reading, and the client's call is cancelled. Either way the slot
 // comes back respawned, so no document can hold a worker for good.
+//
+// Progress is a forwarded message, or a progress signal from the worker
+// itself: each worker gets one end of a datagram socket pair (its
+// --progress-fd), and the engine signals on it while it works through a
+// phase that streams nothing, the page inventory a document's first Parse
+// builds by loading every page. A long document's inventory therefore runs
+// as long as its pages keep loading, and only a page that stops the engine
+// for the stall limit costs the worker (and the inventory cache it holds).
 class WorkerPool {
  public:
   struct Lease {
@@ -69,6 +77,9 @@ class WorkerPool {
     std::string socket_path;
     std::shared_ptr<grpc::Channel> channel;
     std::unique_ptr<Stub> stub;
+    // The front's end of the worker's progress socket pair; -1 when the
+    // pair could not be made (the worker then runs without signalling).
+    int progress_fd = -1;
     // Leased, or being respawned.
     bool busy = false;
     // The call holding the lease; null while the slot is free or respawning,
@@ -89,6 +100,7 @@ class WorkerPool {
     pid_t pid = -1;
     std::shared_ptr<grpc::Channel> channel;
     std::unique_ptr<Stub> stub;
+    int progress_fd = -1;
   };
 
   // Starts one worker on socket_path and waits for its socket to come up.

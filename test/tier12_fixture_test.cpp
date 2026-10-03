@@ -3,8 +3,9 @@
 // signed.pdf the signature field, the encrypted pair the encryption info
 // and the password load statuses, page-tree.pdf the page geometry a page
 // inherits through the page tree, form-xobject.pdf content nested in Form
-// XObjects and invisible text, huge-image.pdf the image decode limit, and
-// font-names.pdf font names that are not valid UTF-8.
+// XObjects and invisible text, huge-image.pdf the image decode limit,
+// font-names.pdf font names that are not valid UTF-8, and byte-strings.pdf
+// link and outline URIs and signature fields that are not valid UTF-8.
 
 #include <algorithm>
 #include <chrono>
@@ -144,9 +145,10 @@ int main(int argc, char** argv) {
   const std::string form_xobject = ReadFile(dir + "/form-xobject.pdf");
   const std::string huge_image = ReadFile(dir + "/huge-image.pdf");
   const std::string font_names = ReadFile(dir + "/font-names.pdf");
+  const std::string byte_strings = ReadFile(dir + "/byte-strings.pdf");
   Check(!rich.empty() && !signed_doc.empty() && !enc_open.empty() &&
             !enc_locked.empty() && !page_tree.empty() && !form_xobject.empty() &&
-            !huge_image.empty() && !font_names.empty(),
+            !huge_image.empty() && !font_names.empty() && !byte_strings.empty(),
         "fixtures read");
 
   // ValidUtf8: well-formed UTF-8 passes through; each byte of an
@@ -253,6 +255,53 @@ int main(int argc, char** argv) {
           "GBK base font name arrives as Latin-1 UTF-8");
     Check(has("\xE5\xAE\x8B\xE4\xBD\x93"),
           "UTF-8 base font name arrives unchanged");
+  }
+
+  // byte-strings.pdf: the backend copies a URI, a signature's /SubFilter
+  // name and its /M date as stored bytes, not decoded text, so each is
+  // made valid UTF-8 (Latin-1 per ill-formed byte) like a font name. The
+  // deadline turns the old failure (a client stalled on a message it
+  // cannot parse) into a failed check.
+  {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(30));
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_data(byte_strings);
+    request.add_families(pdfv1::PDF_FAMILY_HYPERLINKS);
+    request.add_families(pdfv1::PDF_FAMILY_OUTLINE);
+    request.add_families(pdfv1::PDF_FAMILY_SIGNATURES);
+    auto reader = stub->Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    std::vector<std::string> link_uris;
+    std::vector<std::string> outline_uris;
+    pdfv1::SignatureChunk signatures;
+    while (reader->Read(&msg)) {
+      if (msg.has_page()) {
+        for (const auto& link : msg.page().hyperlinks()) {
+          link_uris.push_back(link.uri());
+        }
+      }
+      if (msg.has_outline()) {
+        for (const auto& node : msg.outline().roots()) {
+          outline_uris.push_back(node.uri());
+        }
+      }
+      if (msg.has_signatures()) signatures = msg.signatures();
+    }
+    Check(reader->Finish().ok(), "byte-strings Parse OK");
+    Check(link_uris == std::vector<std::string>{"https://example.com/caf\xC3\xA9"},
+          "a Latin-1 link URI arrives as UTF-8");
+    Check(outline_uris ==
+              std::vector<std::string>{"https://example.com/\xC3\x80\xC2\xAF"},
+          "an overlong outline URI arrives as Latin-1 UTF-8");
+    Check(signatures.signatures_size() == 1, "byte-strings signature arrived");
+    if (signatures.signatures_size() == 1) {
+      const auto& sig = signatures.signatures(0);
+      Check(sig.sub_filter() == "adbe.x509.\xC3\x8B\xC3\x8E",
+            "a GBK signature sub filter arrives as Latin-1 UTF-8");
+      Check(sig.signing_time_raw() == "D:20260904110000\xC3\xBF",
+            "a signing time with a stray byte arrives as Latin-1 UTF-8");
+    }
   }
 
   // Parse rich.pdf with heavy payloads: every claimed family delivers.
@@ -673,6 +722,19 @@ int main(int argc, char** argv) {
     const Ranged mismatched = parse_page(hello, &sha, 0);
     Check(mismatched.inventory == 1 && mismatched.loads == 2,
           "cached inventory is keyed to the bytes it was built from");
+
+    // The progress hook runs once per page the inventory loads (what keeps
+    // the pool's watchdog off a long first Parse), and never when the
+    // inventory comes from the cache. The hash's entry now holds hello.pdf
+    // (the mismatch above replaced it), so the first call rebuilds.
+    int signals = 0;
+    grpc_pdfium::PdfiumEngine::SetProgressHook([&signals] { ++signals; });
+    parse_page(page_tree, &sha, 0);
+    Check(signals == 4, "the inventory signals progress once per page");
+    signals = 0;
+    parse_page(page_tree, &sha, 0);
+    Check(signals == 0, "a cached inventory signals nothing");
+    grpc_pdfium::PdfiumEngine::SetProgressHook(nullptr);
   }
 
   // form-xobject.pdf: text drawn with 3 Tr is the invisible OCR underlay,
