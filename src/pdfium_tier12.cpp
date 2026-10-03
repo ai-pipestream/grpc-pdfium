@@ -104,6 +104,49 @@ void SetBox(pdfv1::BoundingBox* box, float l, float b, float r, float t) {
   box->set_y1(std::max(b, t));
 }
 
+// Affine maps in PDF's row-vector convention: a point (x, y) goes to
+// (a x + c y + e, b x + d y + f).
+constexpr FS_MATRIX kIdentity{1, 0, 0, 1, 0, 0};
+
+FS_POINTF Apply(const FS_MATRIX& m, float x, float y) {
+  return {m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f};
+}
+
+// first, then second.
+FS_MATRIX Concat(const FS_MATRIX& first, const FS_MATRIX& second) {
+  return {first.a * second.a + first.b * second.c,
+          first.a * second.b + first.b * second.d,
+          first.c * second.a + first.d * second.c,
+          first.c * second.b + first.d * second.d,
+          first.e * second.a + first.f * second.c + second.e,
+          first.e * second.b + first.f * second.d + second.f};
+}
+
+// The page-space bounds of an object whose bounds PDFium reports in its
+// parent's space (the page, or the enclosing Form XObject's space).
+bool SetPageBounds(FPDF_PAGEOBJECT obj, const FS_MATRIX& to_page,
+                   pdfv1::BoundingBox* box) {
+  float l = 0;
+  float b = 0;
+  float r = 0;
+  float t = 0;
+  if (!FPDFPageObj_GetBounds(obj, &l, &b, &r, &t)) return false;
+  const FS_POINTF corners[] = {Apply(to_page, l, b), Apply(to_page, r, b),
+                               Apply(to_page, r, t), Apply(to_page, l, t)};
+  float x0 = corners[0].x;
+  float y0 = corners[0].y;
+  float x1 = x0;
+  float y1 = y0;
+  for (const FS_POINTF& c : corners) {
+    x0 = std::min(x0, c.x);
+    y0 = std::min(y0, c.y);
+    x1 = std::max(x1, c.x);
+    y1 = std::max(y1, c.y);
+  }
+  SetBox(box, x0, y0, x1, y1);
+  return true;
+}
+
 void FillDestination(FPDF_DOCUMENT doc, FPDF_DEST dest,
                      pdfv1::PageDestination* out) {
   out->set_page_index(
@@ -494,20 +537,25 @@ void FillFormFields(FPDF_FORMHANDLE handle, FPDF_PAGE page,
   }
 }
 
-void FillQuadFromRotatedBounds(FPDF_PAGEOBJECT obj, pdfv1::Quad* quad,
+void FillQuadFromRotatedBounds(FPDF_PAGEOBJECT obj, const FS_MATRIX& to_page,
+                               pdfv1::Quad* quad,
                                const pdfv1::BoundingBox& fallback) {
   FS_QUADPOINTSF pts;
   if (FPDFPageObj_GetRotatedBounds(obj, &pts)) {
     // Rotated bounds arrive as the four corners in drawing order; map to
     // the contract's lower-left-first convention via the bounding order.
-    quad->set_x0(pts.x1);
-    quad->set_y0(pts.y1);
-    quad->set_x1(pts.x2);
-    quad->set_y1(pts.y2);
-    quad->set_x2(pts.x3);
-    quad->set_y2(pts.y3);
-    quad->set_x3(pts.x4);
-    quad->set_y3(pts.y4);
+    const FS_POINTF p1 = Apply(to_page, pts.x1, pts.y1);
+    const FS_POINTF p2 = Apply(to_page, pts.x2, pts.y2);
+    const FS_POINTF p3 = Apply(to_page, pts.x3, pts.y3);
+    const FS_POINTF p4 = Apply(to_page, pts.x4, pts.y4);
+    quad->set_x0(p1.x);
+    quad->set_y0(p1.y);
+    quad->set_x1(p2.x);
+    quad->set_y1(p2.y);
+    quad->set_x2(p3.x);
+    quad->set_y2(p3.y);
+    quad->set_x3(p4.x);
+    quad->set_y3(p4.y);
     return;
   }
   quad->set_x0(fallback.x0());
@@ -597,18 +645,11 @@ bool BitmapToEncodedImage(FPDF_BITMAP bitmap, pdfv1::EncodedImage* out) {
   return true;
 }
 
-void FillImage(FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_PAGEOBJECT obj,
+void FillImage(FPDF_PAGE page, FPDF_PAGEOBJECT obj, const FS_MATRIX& to_page,
                bool include_data, pdfv1::PageChunk* chunk) {
-  (void)doc;
   auto* image = chunk->add_images();
-  float l = 0;
-  float b = 0;
-  float r = 0;
-  float t = 0;
-  if (FPDFPageObj_GetBounds(obj, &l, &b, &r, &t)) {
-    SetBox(image->mutable_bbox(), l, b, r, t);
-  }
-  FillQuadFromRotatedBounds(obj, image->mutable_quad(), image->bbox());
+  SetPageBounds(obj, to_page, image->mutable_bbox());
+  FillQuadFromRotatedBounds(obj, to_page, image->mutable_quad(), image->bbox());
   FPDF_IMAGEOBJ_METADATA meta;
   if (FPDFImageObj_GetImageMetadata(obj, page, &meta)) {
     image->set_source_width_px(meta.width);
@@ -627,13 +668,16 @@ void FillImage(FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_PAGEOBJECT obj,
   }
 }
 
-void FillShape(FPDF_PAGEOBJECT obj, pdfv1::PageChunk* chunk) {
+void FillShape(FPDF_PAGEOBJECT obj, const FS_MATRIX& to_page,
+               pdfv1::PageChunk* chunk) {
   auto* shape = chunk->add_shapes();
-  FS_MATRIX m{1, 0, 0, 1, 0, 0};
+  FS_MATRIX m = kIdentity;
   FPDFPageObj_GetMatrix(obj, &m);
+  m = Concat(m, to_page);
   auto transform = [&m](float x, float y, pdfv1::PathPoint* out) {
-    out->set_x(m.a * x + m.c * y + m.e);
-    out->set_y(m.b * x + m.d * y + m.f);
+    const FS_POINTF p = Apply(m, x, y);
+    out->set_x(p.x);
+    out->set_y(p.y);
   };
   int segments = FPDFPath_CountSegments(obj);
   int bezier_phase = 0;
@@ -713,13 +757,7 @@ void FillShape(FPDF_PAGEOBJECT obj, pdfv1::PageChunk* chunk) {
   }
   float width = 0;
   if (FPDFPageObj_GetStrokeWidth(obj, &width)) shape->set_line_width(width);
-  float l = 0;
-  float b = 0;
-  float r = 0;
-  float t = 0;
-  if (FPDFPageObj_GetBounds(obj, &l, &b, &r, &t)) {
-    SetBox(shape->mutable_bbox(), l, b, r, t);
-  }
+  SetPageBounds(obj, to_page, shape->mutable_bbox());
 }
 
 // FPDFText_GetFontInfo reports PDFium's internal font flags; the descriptor
@@ -779,6 +817,65 @@ void FillFontFromObject(FPDF_PAGEOBJECT obj, bool want_program,
   const std::string name = BaseFontName(font);
   if (name.empty()) return;
   InternFont(font, name, want_program, fonts, new_fonts, embedded_fonts);
+}
+
+// What one page's object walk fills.
+struct ObjectWalk {
+  FPDF_PAGE page;
+  bool want_images;
+  bool want_shapes;
+  bool want_fonts;
+  bool want_programs;
+  bool include_image_data;
+  FontInterner* fonts;
+  pdfv1::PageChunk* chunk;
+  pdfv1::FontTableChunk* new_fonts;
+  std::vector<pdfv1::EmbeddedFont>* embedded_fonts;
+};
+
+// Visits the objects of the page (form null) or of one Form XObject,
+// descending into nested forms: many generators wrap a whole page in one,
+// and its images, paths and fonts belong to the page all the same. A
+// form's objects live in the form's space; to_page maps that space onto
+// the page. Malformed nesting is cut at a fixed depth.
+void WalkObjects(const ObjectWalk& walk, FPDF_PAGEOBJECT form,
+                 const FS_MATRIX& to_page, int depth) {
+  const int count = form == nullptr ? FPDFPage_CountObjects(walk.page)
+                                    : FPDFFormObj_CountObjects(form);
+  for (int i = 0; i < count; ++i) {
+    FPDF_PAGEOBJECT obj =
+        form == nullptr
+            ? FPDFPage_GetObject(walk.page, i)
+            : FPDFFormObj_GetObject(form, static_cast<unsigned long>(i));
+    if (obj == nullptr) continue;
+    switch (FPDFPageObj_GetType(obj)) {
+      case FPDF_PAGEOBJ_IMAGE:
+        if (walk.want_images) {
+          FillImage(walk.page, obj, to_page, walk.include_image_data,
+                    walk.chunk);
+        }
+        break;
+      case FPDF_PAGEOBJ_PATH:
+        if (walk.want_shapes) FillShape(obj, to_page, walk.chunk);
+        break;
+      case FPDF_PAGEOBJ_TEXT:
+        if (walk.want_fonts) {
+          FillFontFromObject(obj, walk.want_programs, walk.fonts,
+                             walk.new_fonts, walk.embedded_fonts);
+        }
+        break;
+      case FPDF_PAGEOBJ_FORM: {
+        // The form object's matrix maps the form's space into its parent's.
+        FS_MATRIX form_matrix;
+        if (depth < 64 && FPDFPageObj_GetMatrix(obj, &form_matrix)) {
+          WalkObjects(walk, obj, Concat(form_matrix, to_page), depth + 1);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
 }
 
 void FillThumbnail(FPDF_PAGE page, pdfv1::PageChunk* chunk) {
@@ -928,30 +1025,17 @@ void ExtractPageTier12(FPDF_DOCUMENT doc, FPDF_PAGE page,
   const bool want_fonts =
       WantFamily(request, pdfv1::PDF_FAMILY_FONTS) || want_programs;
   if (want_images || want_shapes || want_fonts) {
-    int objects = FPDFPage_CountObjects(page);
-    for (int i = 0; i < objects; ++i) {
-      FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
-      if (obj == nullptr) continue;
-      switch (FPDFPageObj_GetType(obj)) {
-        case FPDF_PAGEOBJ_IMAGE:
-          if (want_images) {
-            FillImage(doc, page, obj, request.options().include_image_data(),
-                      chunk);
-          }
-          break;
-        case FPDF_PAGEOBJ_PATH:
-          if (want_shapes) FillShape(obj, chunk);
-          break;
-        case FPDF_PAGEOBJ_TEXT:
-          if (want_fonts) {
-            FillFontFromObject(obj, want_programs, fonts, new_fonts,
-                               embedded_fonts);
-          }
-          break;
-        default:
-          break;
-      }
-    }
+    const ObjectWalk walk{page,
+                          want_images,
+                          want_shapes,
+                          want_fonts,
+                          want_programs,
+                          request.options().include_image_data(),
+                          fonts,
+                          chunk,
+                          new_fonts,
+                          embedded_fonts};
+    WalkObjects(walk, nullptr, kIdentity, 0);
   }
   if (WantFamily(request, pdfv1::PDF_FAMILY_HYPERLINKS)) {
     FillHyperlinks(doc, page, chunk);

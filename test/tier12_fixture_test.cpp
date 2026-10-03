@@ -5,6 +5,7 @@
 // inherits through the page tree, and form-xobject.pdf content nested in
 // Form XObjects and invisible text.
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <map>
@@ -478,6 +479,59 @@ int main(int argc, char** argv) {
           "3 Tr text reports INVISIBLE");
     Check(modes["Inside"] == pdfv1::TEXT_RENDERING_MODE_FILL,
           "text inside a Form XObject reports its own mode");
+  }
+
+  // form-xobject.pdf: images, paths and fonts inside Form XObjects (one
+  // nested in another) belong to the page, in page space. Text cells are
+  // not requested, so Courier, drawn only inside the form, can reach the
+  // font table through the form walk alone.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_data(form_xobject);
+    request.add_families(pdfv1::PDF_FAMILY_PLACED_IMAGES);
+    request.add_families(pdfv1::PDF_FAMILY_VECTOR_SHAPES);
+    request.add_families(pdfv1::PDF_FAMILY_FONTS);
+    auto reader = stub->Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    pdfv1::PageChunk page;
+    std::vector<std::string> font_names;
+    while (reader->Read(&msg)) {
+      if (msg.has_page()) page = msg.page();
+      if (msg.has_fonts()) {
+        for (const auto& f : msg.fonts().fonts()) font_names.push_back(f.base_name());
+      }
+    }
+    Check(reader->Finish().ok(), "form-xobject Parse OK");
+    auto near = [](double a, double b) { return a > b - 0.01 && a < b + 0.01; };
+    auto box_near = [&near](const pdfv1::BoundingBox& box, double x0, double y0,
+                            double x1, double y1) {
+      return near(box.x0(), x0) && near(box.y0(), y0) && near(box.x1(), x1) &&
+             near(box.y1(), y1);
+    };
+    Check(page.images_size() == 2, "both images inside the forms are placed");
+    if (page.images_size() == 2) {
+      Check(box_near(page.images(0).bbox(), 210, 310, 260, 350),
+            "image in a form maps through the form matrix and the CTM");
+      Check(box_near(page.images(1).bbox(), 310, 310, 330, 330),
+            "image in a nested form maps through both forms");
+      Check(near(page.images(1).quad().x0(), 310) &&
+                near(page.images(1).quad().y2(), 330),
+            "nested image quad is in page space");
+    }
+    Check(page.shapes_size() == 1, "the path inside the form is a shape");
+    if (page.shapes_size() == 1) {
+      const auto& shape = page.shapes(0);
+      Check(box_near(shape.bbox(), 220, 370, 300, 400),
+            "shape bounds are in page space");
+      Check(shape.segments_size() > 0 && shape.segments(0).has_move_to() &&
+                near(shape.segments(0).move_to().x(), 220) &&
+                near(shape.segments(0).move_to().y(), 370),
+            "shape points are in page space");
+    }
+    Check(std::find(font_names.begin(), font_names.end(), "Courier") !=
+              font_names.end(),
+          "a font used only inside a form reaches the table");
   }
 
   // signed.pdf: the signature family delivers what is stored.
