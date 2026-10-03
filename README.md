@@ -30,11 +30,17 @@ caches verified bytes, and answers hash-only lookups from the cache (a miss
 answers `LOAD_STATUS_BYTES_REQUIRED`). Both verdicts are typed on each
 RPC's own surface: `ProbeResponse.capabilities`, the `Parse` header, the
 `RenderResponse` head. Workers always receive full bytes over their unix
-sockets and stay stateless, so a worker respawn never loses cached content.
-The cache is an in-memory LRU bounded by document count
+sockets and keep no document bytes, so a worker respawn never loses cached
+content. The cache is an in-memory LRU bounded by document count
 (`GRPC_PDFIUM_CACHE_MAX_DOCUMENTS`, default 8; 0 disables) and by total
 bytes (`GRPC_PDFIUM_CACHE_MAX_BYTES`, default 2 GiB). Hashes come from the
 boringssl the gRPC build already carries.
+
+`Parse` loads only the pages its range selects, one at a time. Its header
+still lists every page, and PDFium reads page boxes and rotation only from
+a loaded page, so each worker remembers the page inventory of the last few
+documents it parsed, keyed by the same hash; a client that parses one page
+per call pays a load of every page once per document, not once per call.
 
 ## Build and test
 

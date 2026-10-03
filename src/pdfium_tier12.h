@@ -53,13 +53,11 @@ void ExtractPageTier12(
     ai::protomolt::parse::pdf::v1::FontTableChunk* new_fonts,
     std::vector<ai::protomolt::parse::pdf::v1::EmbeddedFont>* embedded_fonts);
 
-// Emits one StructTreeChunk assembled from every page's structure tree.
-// Only called for tagged documents. Returns false when emit returned false.
-bool EmitStructTree(
-    const std::vector<FPDF_PAGE>& pages,
-    const std::function<
-        bool(const ai::protomolt::parse::pdf::v1::ParseResponse&)>& emit,
-    uint64_t* node_count);
+// Appends one page's structure tree roots to chunk, counting the nodes.
+// Only called for tagged documents.
+void AppendStructTree(FPDF_PAGE page, uint32_t page_index,
+                      ai::protomolt::parse::pdf::v1::StructTreeChunk* chunk,
+                      uint64_t* node_count);
 
 // True when the request selects this family (empty selection = all).
 bool WantFamily(const ai::protomolt::parse::pdf::v1::ParseRequest& request,

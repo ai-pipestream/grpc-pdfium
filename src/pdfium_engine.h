@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 
 #include <grpcpp/support/status.h>
@@ -23,6 +24,9 @@ class PdfiumEngine {
 
   // The engine identity string reported in BackendCapabilities.
   static const char* EngineVersion();
+
+  // Pages the engine has loaded in this process. Tests and logging only.
+  static uint64_t PageLoads();
 
   // Loads the document and fills the per-document capability verdicts.
   static void Probe(const ai::protomolt::parse::pdf::v1::PdfDocument& document,

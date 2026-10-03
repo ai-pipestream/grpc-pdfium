@@ -10,10 +10,13 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 
 #include "pdf_backend_service_impl.h"
+#include "pdfium_engine.h"
+#include "sha256.h"
 
 namespace pdfv1 = ai::protomolt::parse::pdf::v1;
 
@@ -365,6 +368,57 @@ int main(int argc, char** argv) {
               first_cells[1].bbox().x0() > 99.0 &&
               first_cells[1].bbox().x0() < 101.0,
           "cells stay in user space, not shifted by the CropBox origin");
+  }
+
+  // Parse loads only the pages it needs. The header still lists every page,
+  // but the inventory costs a load per page once per document hash, and a
+  // page range costs one load per page in it. gRParse parses a long
+  // document one page per call, so this is N page loads instead of N^2.
+  {
+    struct Ranged {
+      int inventory = 0;
+      std::vector<uint32_t> pages;
+      uint64_t loads = 0;
+    };
+    auto parse_page = [&stub](const std::string& data, const std::string* sha,
+                              uint32_t page) {
+      Ranged out;
+      const uint64_t before = grpc_pdfium::PdfiumEngine::PageLoads();
+      grpc::ClientContext ctx;
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(data);
+      if (sha != nullptr) request.mutable_document()->set_sha256(*sha);
+      request.add_families(pdfv1::PDF_FAMILY_TEXT_CELLS);
+      request.mutable_pages()->set_begin(page);
+      request.mutable_pages()->set_end(page + 1);
+      auto reader = stub->Parse(&ctx, request);
+      pdfv1::ParseResponse msg;
+      while (reader->Read(&msg)) {
+        if (msg.has_header()) out.inventory = msg.header().pages_size();
+        if (msg.has_page()) out.pages.push_back(msg.page().page_index());
+      }
+      Check(reader->Finish().ok(), "ranged Parse OK");
+      out.loads = grpc_pdfium::PdfiumEngine::PageLoads() - before;
+      return out;
+    };
+    const std::string sha = grpc_pdfium::Sha256Hex(page_tree);
+    const Ranged first = parse_page(page_tree, &sha, 2);
+    Check(first.inventory == 4 && first.pages == std::vector<uint32_t>{2},
+          "ranged Parse lists every page and emits only the range");
+    Check(first.loads == 5, "first ranged Parse loads each page once, plus the range");
+    const Ranged second = parse_page(page_tree, &sha, 3);
+    Check(second.inventory == 4 && second.pages == std::vector<uint32_t>{3},
+          "cached inventory still lists every page");
+    Check(second.loads == 1, "later ranged Parse of the same hash loads one page");
+    const Ranged unhashed = parse_page(page_tree, nullptr, 0);
+    Check(unhashed.inventory == 4 && unhashed.loads == 5,
+          "without a hash the inventory is rebuilt");
+    // A hash that does not fit the bytes (another size, another page count)
+    // is never served the cached inventory.
+    const std::string hello = ReadFile(dir + "/hello.pdf");
+    const Ranged mismatched = parse_page(hello, &sha, 0);
+    Check(mismatched.inventory == 1 && mismatched.loads == 2,
+          "cached inventory is keyed to the bytes it was built from");
   }
 
   // signed.pdf: the signature family delivers what is stored.

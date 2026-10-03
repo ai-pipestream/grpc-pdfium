@@ -912,26 +912,17 @@ void ExtractPageTier12(FPDF_DOCUMENT doc, FPDF_PAGE page,
   }
 }
 
-bool EmitStructTree(const std::vector<FPDF_PAGE>& pages,
-                    const std::function<bool(const pdfv1::ParseResponse&)>& emit,
-                    uint64_t* node_count) {
-  pdfv1::ParseResponse msg;
-  auto* chunk = msg.mutable_struct_tree();
-  for (size_t p = 0; p < pages.size(); ++p) {
-    if (pages[p] == nullptr) continue;
-    FPDF_STRUCTTREE tree = FPDF_StructTree_GetForPage(pages[p]);
-    if (tree == nullptr) continue;
-    int children = FPDF_StructTree_CountChildren(tree);
-    for (int c = 0; c < children; ++c) {
-      FPDF_STRUCTELEMENT elem = FPDF_StructTree_GetChildAtIndex(tree, c);
-      if (elem == nullptr) continue;
-      FillStructElement(elem, static_cast<uint32_t>(p), chunk->add_roots(), 0,
-                        node_count);
-    }
-    FPDF_StructTree_Close(tree);
+void AppendStructTree(FPDF_PAGE page, uint32_t page_index,
+                      pdfv1::StructTreeChunk* chunk, uint64_t* node_count) {
+  FPDF_STRUCTTREE tree = FPDF_StructTree_GetForPage(page);
+  if (tree == nullptr) return;
+  int children = FPDF_StructTree_CountChildren(tree);
+  for (int c = 0; c < children; ++c) {
+    FPDF_STRUCTELEMENT elem = FPDF_StructTree_GetChildAtIndex(tree, c);
+    if (elem == nullptr) continue;
+    FillStructElement(elem, page_index, chunk->add_roots(), 0, node_count);
   }
-  if (chunk->roots().empty()) return true;
-  return emit(msg);
+  FPDF_StructTree_Close(tree);
 }
 
 }  // namespace tier12

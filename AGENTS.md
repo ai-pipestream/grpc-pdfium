@@ -25,8 +25,11 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   `LOAD_STATUS_BYTES_REQUIRED` / `LOAD_STATUS_HASH_MISMATCH`) lives in the
   FRONT process only (`src/proxy_service_impl.cpp`, `src/byte_cache.*`):
   it owns the client-facing wire, and workers always receive full bytes
-  over their unix sockets. Cache bounds are env knobs
-  `GRPC_PDFIUM_CACHE_MAX_DOCUMENTS` (default 8, 0 disables) and
+  over their unix sockets. A worker's only state is derived: the page
+  inventory cache in `src/pdfium_engine.cpp`, keyed by the hash the front
+  forwards (it relies on the front's hash check), so `Parse` loads only the
+  requested pages after the first call for a document. Byte cache bounds
+  are env knobs `GRPC_PDFIUM_CACHE_MAX_DOCUMENTS` (default 8, 0 disables) and
   `GRPC_PDFIUM_CACHE_MAX_BYTES` (default 2 GiB). SHA-256 is boringssl's
   one-shot `SHA256()` (`src/sha256.*`), the TLS library gRPC already
   builds; do not add another crypto dependency.
