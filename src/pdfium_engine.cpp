@@ -137,6 +137,9 @@ void FillCapabilities(const LoadedDocument& loaded,
       case pdfv1::PDF_FAMILY_SIGNATURES: absent = facts.signature_count == 0; break;
       case pdfv1::PDF_FAMILY_JAVASCRIPT: absent = facts.javascript_count == 0; break;
       case pdfv1::PDF_FAMILY_ATTACHMENTS: absent = facts.attachment_count == 0; break;
+      // Without an interactive form the engine has no form handle and
+      // emits no widget, so a caller can skip the page walk.
+      case pdfv1::PDF_FAMILY_FORM_FIELDS: absent = !facts.has_form; break;
       case pdfv1::PDF_FAMILY_DEEP_RESOURCES:
         verdict->set_support(pdfv1::FAMILY_SUPPORT_UNSUPPORTED_BY_BACKEND);
         verdict->set_detail("the engine does not type out page resources");

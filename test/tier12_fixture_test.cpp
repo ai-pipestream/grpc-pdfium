@@ -168,6 +168,9 @@ int main(int argc, char** argv) {
     Check(SupportOf(caps, pdfv1::PDF_FAMILY_ENCRYPTION_INFO) ==
               pdfv1::FAMILY_SUPPORT_ABSENT_IN_DOCUMENT,
           "unencrypted fixture declares encryption absent");
+    Check(SupportOf(caps, pdfv1::PDF_FAMILY_FORM_FIELDS) ==
+              pdfv1::FAMILY_SUPPORT_SUPPORTED,
+          "fixture with an AcroForm declares form fields supported");
     Check(SupportOf(caps, pdfv1::PDF_FAMILY_DEEP_RESOURCES) ==
               pdfv1::FAMILY_SUPPORT_UNSUPPORTED_BY_BACKEND,
           "deep resources declared unsupported by this engine");
@@ -249,7 +252,7 @@ int main(int argc, char** argv) {
       if (link.has_destination()) saw_dest = true;
     }
     Check(saw_uri && saw_dest, "URI and goto link targets present");
-    Check(s.page.annotations_size() == 5, "all annotations listed");
+    Check(s.page.annotations_size() == 6, "all annotations listed");
     bool highlight_ok = false;
     for (const auto& a : s.page.annotations()) {
       if (a.kind() == pdfv1::ANNOTATION_KIND_HIGHLIGHT) {
@@ -258,13 +261,29 @@ int main(int argc, char** argv) {
       }
     }
     Check(highlight_ok, "highlight has author, quad, color, contents");
-    Check(s.page.form_fields_size() == 1, "form field arrived");
-    if (s.page.form_fields_size() == 1) {
+    Check(s.page.form_fields_size() == 2, "both form field widgets arrived");
+    if (s.page.form_fields_size() == 2) {
       const auto& f = s.page.form_fields(0);
       Check(f.kind() == pdfv1::FORM_FIELD_KIND_TEXT, "field kind");
       Check(f.name() == "customer_name", "field name");
       Check(f.value() == "Jordan Example", "field value");
       Check(f.alternate_name() == "Customer name", "field tooltip");
+      Check(f.has_flags() && f.flags() == 0 && !f.read_only(),
+            "text field flags are empty");
+      Check(!f.has_appearance_state(), "text widget has no /AS");
+      // The check box widget inherits /FT and /Ff (ReadOnly) from its
+      // parent field; /AS is the widget's own.
+      const auto& box = s.page.form_fields(1);
+      Check(box.kind() == pdfv1::FORM_FIELD_KIND_CHECK_BOX,
+            "check box kind inherited from the parent field");
+      Check(box.name() == "agree", "check box takes the parent's name");
+      Check(box.has_flags() && box.flags() == 1, "/Ff inherited from the parent");
+      Check(box.read_only(), "read-only follows the inherited /Ff");
+      Check(box.appearance_state() == "/Yes", "/AS keeps the leading slash");
+      Check(box.alternate_name() == "I agree", "check box tooltip inherited");
+      Check(box.value() == "Yes", "button value is the bare state name");
+      Check(box.rect().x0() == 300 && box.rect().y1() == 265,
+            "check box widget rect");
     }
     Check(s.page.shapes_size() == 1, "vector shape arrived");
     if (s.page.shapes_size() == 1) {

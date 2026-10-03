@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Regenerates rich.pdf, the tier 1-2 fixture: one Letter page carrying
 document metadata, a two-item outline, a URI link and a goto link, a
-highlight and a sticky-note annotation, a text form field, document
+highlight and a sticky-note annotation, a text form field, a check box
+whose field type and read-only /Ff flag are inherited from its parent
+field and whose widget shows the /Yes appearance state, document
 JavaScript, an embedded CSV attachment, a placed 4x4 RGB image, a filled
 and stroked path with a bezier, a page thumbnail, an embedded TrueType
 font (UbuntuMono, UFL-licensed), and a tagged structure tree with one P
@@ -37,7 +39,7 @@ def stream(dict_body: bytes, data: bytes) -> bytes:
 objects = [
     # 1: catalog
     b"<< /Type /Catalog /Pages 2 0 R /Outlines 6 0 R /MarkInfo << /Marked true >> "
-    b"/StructTreeRoot 15 0 R /AcroForm << /Fields [11 0 R] /DA (/Helv 0 Tf 0 g) "
+    b"/StructTreeRoot 15 0 R /AcroForm << /Fields [11 0 R 25 0 R] /DA (/Helv 0 Tf 0 g) "
     b"/DR << /Font << /Helv 4 0 R >> >> >> "
     b"/Names << /EmbeddedFiles << /Names [(report.csv) 13 0 R] >> "
     b"/JavaScript << /Names [(init) 14 0 R] >> >> >>",
@@ -47,7 +49,7 @@ objects = [
     b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 "
     b"/Resources << /Font << /F1 4 0 R /F2 20 0 R >> "
     b"/XObject << /Im0 19 0 R >> >> /Contents 5 0 R "
-    b"/Annots [9 0 R 10 0 R 11 0 R 12 0 R 23 0 R] /Thumb 18 0 R >>",
+    b"/Annots [9 0 R 10 0 R 11 0 R 12 0 R 23 0 R 26 0 R] /Thumb 18 0 R >>",
     # 4: Helvetica
     b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     # 5: content
@@ -116,6 +118,17 @@ objects = [
     b"/Dest [3 0 R /XYZ 100 500 2.0] >>",
     # 24: font program
     stream(b"/Length1 " + str(len(font_data)).encode(), font_data),
+    # 25: check box parent field; the kid widget inherits /FT and /Ff
+    # (1 = ReadOnly) from it
+    b"<< /FT /Btn /T (agree) /Ff 1 /V /Yes /TU (I agree) /Kids [26 0 R] >>",
+    # 26: check box widget, the terminal field, showing the /Yes state
+    b"<< /Type /Annot /Subtype /Widget /Parent 25 0 R /P 3 0 R "
+    b"/Rect [300 250 315 265] /F 4 /AS /Yes "
+    b"/AP << /N << /Yes 27 0 R /Off 28 0 R >> >> >>",
+    # 27: the /Yes appearance (a filled square)
+    stream(b"/Type /XObject /Subtype /Form /BBox [0 0 15 15]", b"0 g 3 3 9 9 re f"),
+    # 28: the /Off appearance (empty)
+    stream(b"/Type /XObject /Subtype /Form /BBox [0 0 15 15]", b""),
 ]
 
 info = (
@@ -124,7 +137,7 @@ info = (
     b"/Producer (by hand) /CreationDate (D:20260904090000Z) "
     b"/ModDate (D:20260904100000Z) >>"
 )
-objects.append(info)  # 25
+objects.append(info)  # 29
 
 out = bytearray(b"%PDF-1.7\n")
 offsets = []
