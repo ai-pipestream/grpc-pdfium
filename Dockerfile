@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1.27
-# grpc-pdfium, amd64-only like the rest of the family's C++ services.
+# grpc-pdfium, published as a linux/amd64 + linux/arm64 manifest list; each
+# architecture builds and tests natively on its own runner pool.
 #
 # The build stage compiles the service and runs the test suite; the tests
 # gate the image. The engine is the sha256-pinned PDFium prebuilt downloaded
@@ -29,10 +30,11 @@ COPY . .
 # The image tag, reported by GetServiceInfo as build_version.
 ARG GRPC_PDFIUM_BUILD_VERSION=latest
 # The cache id encodes every ABI-sensitive dependency; bump it when gRPC,
-# PDFium, or the toolchain moves. The contract protos and the PDFium
-# tarball are downloaded at configure time (both sha256-pinned), so the
-# build needs network access.
-RUN --mount=type=cache,id=grpc-pdfium-trixie-grpc1.83.1-chromium8035,target=/build \
+# PDFium, or the toolchain moves. TARGETARCH keeps the amd64 and arm64 legs
+# from sharing one build tree. The contract protos and the PDFium tarball
+# are downloaded at configure time (both sha256-pinned), so the build needs
+# network access.
+RUN --mount=type=cache,id=grpc-pdfium-trixie-grpc1.83.1-chromium8035-${TARGETARCH},target=/build \
     cmake -S . -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DGRPC_PDFIUM_BUILD_VERSION=${GRPC_PDFIUM_BUILD_VERSION} \
     && cmake --build /build --parallel \

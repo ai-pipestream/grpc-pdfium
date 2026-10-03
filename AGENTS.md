@@ -54,5 +54,7 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   worker count); `ci.yml` runs the image build then the smoke test on
   push/PR, and `.github/workflows/publish.yml` builds, smoke-tests, and
   only then pushes `docker.io/pipestreamai/grpc-pdfium:latest` on push to
-  `main` (amd64 only; Docker Hub auth via the `DOCKER_USER`/`DOCKER_TOKEN`
-  org secrets).
+  `main` as a linux/amd64 + linux/arm64 manifest list (each leg pushes by
+  digest and boot-proofs its own on its own architecture; the arm64 leg
+  runs natively on GitHub's hosted `ubuntu-24.04-arm` runner); Docker Hub auth via the `DOCKER_USER`/`DOCKER_TOKEN`
+  org secrets.

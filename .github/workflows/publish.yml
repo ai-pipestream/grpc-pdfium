@@ -1,14 +1,28 @@
 name: Publish Images
 
 # Builds the service image (the build stage runs the test suite), boot-proofs
-# the runtime stage with scripts/smoke-test.sh, and only then pushes it to
+# the runtime stage with scripts/smoke-test.sh, and only then names it on
 # docker.io/pipestreamai. Every push to main republishes :latest; a manual
 # dispatch with a version input also tags that version and stamps it as the
 # build_version GetServiceInfo reports. Docker Hub credentials come from the
 # DOCKER_USER / DOCKER_TOKEN org secrets.
 #
-# amd64-only, like the rest of the family's C++ services: emulated arm64 C++
-# builds are too slow, so that leg waits on native arm64 runners.
+# Build once, gate, then name. `load: true` cannot carry attestations and a
+# multi-platform image cannot be loaded at all, so every leg is built once
+# with provenance (mode=max) and SBOM attestations and pushed BY DIGEST
+# ONLY: no tag points at it, it is invisible under any public name. The leg
+# then pulls that digest back and runs scripts/smoke-test.sh on its own
+# architecture; only a digest that passed is recorded as an artifact. The
+# `publish` job assembles the recorded digests into the tagged manifest list
+# with `docker buildx imagetools create` (scripts/publish-manifests.sh) and
+# inspects the result: the index must list exactly linux/amd64 and
+# linux/arm64 with one attestation manifest per platform, or the job fails.
+# So the smoke gate still runs before any tag exists, and the attestations
+# on the published image are the ones the build produced.
+#
+# The arm64 leg builds natively on GitHub's hosted ubuntu-24.04-arm runner
+# (free for this public repository); no QEMU anywhere. Each leg runs the
+# ctest suite in its build stage and the smoke test on its own architecture.
 on:
   push:
     branches: [main]
@@ -19,52 +33,138 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: read
+
+env:
+  HUB_REPO: docker.io/pipestreamai/grpc-pdfium
+
 jobs:
-  publish:
+  version:
+    name: Resolve the build version
     runs-on: ubuntu-latest
+    outputs:
+      # Empty on a plain main push: only :latest is republished.
+      version: ${{ inputs.version }}
+      # Always set: stamped into GetServiceInfo as build_version.
+      build_version: ${{ steps.resolve.outputs.build_version }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Log in to Docker Hub (docker.io)
-        uses: docker/login-action@v3
-        with:
-          registry: docker.io
-          username: ${{ secrets.DOCKER_USER }}
-          password: ${{ secrets.DOCKER_TOKEN }}
-      - name: Compute tags and build version
-        id: tags
+      - name: Resolve the build version stamp
+        id: resolve
         env:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          tags="docker.io/pipestreamai/grpc-pdfium:latest"
-          version="$VERSION"
-          if [ -n "$version" ]; then
-            tags="$tags,docker.io/pipestreamai/grpc-pdfium:$version"
+          if [ -n "$VERSION" ]; then
+            version="$VERSION"
           else
             version="latest"
           fi
-          {
-            echo "tags=$tags"
-            echo "push_tags=$(tr ',' ' ' <<<"$tags")"
-            echo "version=$version"
-          } >> "$GITHUB_OUTPUT"
-      - name: Build the service image (runs the test suite in the build stage)
-        uses: docker/build-push-action@v6
+          echo "build_version=$version" >> "$GITHUB_OUTPUT"
+          echo "publishing '${VERSION:-<latest only>}' with build_version $version"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Log in to Docker Hub (docker.io)
+        uses: docker/login-action@v4
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+      - name: Name the repository this leg pushes to by digest
+        id: names
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          echo "names=$HUB_REPO" >> "$GITHUB_OUTPUT"
+          echo "platform_pair=${PLATFORM//\//-}" >> "$GITHUB_OUTPUT"
+      - name: Build (runs the test suite in the build stage) and push by digest
+        id: build
+        uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64
-          load: true
-          provenance: false
-          sbom: false
-          tags: ${{ steps.tags.outputs.tags }}
+          platforms: ${{ matrix.platform }}
+          provenance: mode=max
+          sbom: true
           build-args: |
-            GRPC_PDFIUM_BUILD_VERSION=${{ steps.tags.outputs.version }}
-      - name: Boot-proof the image before any push
-        run: ./scripts/smoke-test.sh docker.io/pipestreamai/grpc-pdfium:latest
-      - name: Push all tags
+            GRPC_PDFIUM_BUILD_VERSION=${{ needs.version.outputs.build_version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.version.outputs.build_version }}
+          outputs: type=image,"name=${{ steps.names.outputs.names }}",push-by-digest=true,name-canonical=true,push=true
+      - name: Boot-proof the pushed digest before it gets a name
+        # The image under test is the exact digest that was pushed, pulled
+        # back from the registry, so what passes here is what gets tagged.
+        env:
+          IMAGE: ${{ env.HUB_REPO }}@${{ steps.build.outputs.digest }}
         run: |
-          for tag in ${{ steps.tags.outputs.push_tags }}; do
-            docker push "$tag"
+          set -euo pipefail
+          docker pull "$IMAGE"
+          ./scripts/smoke-test.sh "$IMAGE"
+      - name: Record the digest that passed
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - name: Upload the digest for the publish job
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ steps.names.outputs.platform_pair }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish the manifest list
+    needs: [version, build]
+    # Runs even when a build leg failed so one failed leg does not hold
+    # the tag hostage: with fewer digests than platforms,
+    # scripts/publish-manifests.sh refuses to tag anything.
+    if: ${{ !cancelled() && needs.version.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download the digests that passed their smoke gate
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Log in to Docker Hub (docker.io)
+        uses: docker/login-action@v4
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+      - name: Create the manifest list and prove it
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          digests=()
+          for file in "$RUNNER_TEMP"/digests/*; do
+            [ -e "$file" ] && digests+=("$(basename "$file")")
           done
+          ./scripts/publish-manifests.sh --version "$VERSION" \
+            --platforms linux/amd64,linux/arm64 --repo "$HUB_REPO" "${digests[@]}"
