@@ -210,6 +210,20 @@ int main(int argc, char** argv) {
           "deep resources declared unsupported by this engine");
   }
 
+  // Without include_attachment_data the attachment is listed but never
+  // decoded: PDFium can only size it by inflating the whole stream, so
+  // size_bytes and data are both left unset.
+  {
+    ParsedStream s = ParseAll(stub.get(), rich, false);
+    Check(s.attachments.size() == 1, "attachment listed on a light Parse");
+    if (s.attachments.size() == 1) {
+      Check(s.attachments[0].name() == "report.csv",
+            "light Parse attachment name");
+      Check(!s.attachments[0].has_size_bytes() && s.attachments[0].data().empty(),
+            "light Parse leaves the attachment undecoded");
+    }
+  }
+
   // font-names.pdf: a GBK /BaseFont reaches the font table as valid UTF-8
   // (Latin-1 per byte) and a UTF-8 one unchanged, so the stream parses on
   // the client (a proto3 string with invalid UTF-8 fails the whole parse).

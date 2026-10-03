@@ -42,9 +42,10 @@ namespace {
 // decoding is where a hostile document turns a few bytes into gigabytes.
 // An image's size is its declared pixel size, checked before PDFium decodes
 // anything. An attachment's size is not: FPDFAttachment_GetFile decodes the
-// whole stream (up to 1 GiB) just to report it, so the ceiling below only
-// keeps oversized bytes out of the message and spares a copy. What bounds
-// that decode is the worker's address-space limit
+// whole stream (up to 1 GiB) just to report it, so it runs only when the
+// request asked for attachment data, and the ceiling below only keeps
+// oversized bytes out of the message and spares a copy. What bounds that
+// decode is the worker's address-space limit
 // (GRPC_PDFIUM_WORKER_MAX_BYTES, main.cpp): a bomb costs one worker.
 //
 // One placed image's pixels, decoded (sized at 4 bytes per pixel, the
@@ -294,15 +295,21 @@ bool EmitAttachments(FPDF_DOCUMENT doc, bool include_data,
         }
       }
     }
+    // FPDFAttachment_GetFile decodes the whole stream to report its size,
+    // and PDFium has no public reader for the recorded /Params /Size, so
+    // the size is only known (and the optional size_bytes only set) when
+    // the data was asked for. A Parse that did not ask never decodes an
+    // attachment, so a bomb fails only the request that wanted its bytes.
     unsigned long size = 0;
-    if (FPDFAttachment_GetFile(att, nullptr, 0, &size) && size > 0) {
+    if (include_data && FPDFAttachment_GetFile(att, nullptr, 0, &size) &&
+        size > 0) {
       meta->set_size_bytes(size);
-      if (include_data && size > kMaxAttachmentBytes) {
+      if (size > kMaxAttachmentBytes) {
         Warn(warnings, std::nullopt, pdfv1::PDF_FAMILY_ATTACHMENTS,
              "attachment " + meta->name() + " data left out: " +
                  std::to_string(size) + " bytes is above the " +
                  std::to_string(kMaxAttachmentBytes >> 20) + " MiB limit");
-      } else if (include_data) {
+      } else {
         std::string data(size, '\0');
         unsigned long got = 0;
         if (FPDFAttachment_GetFile(att, data.data(), size, &got)) {

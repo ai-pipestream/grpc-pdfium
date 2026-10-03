@@ -738,10 +738,11 @@ int main(int argc, char** argv) {
 
   // A decompression bomb: about two kilobytes whose one attachment inflates
   // to 1 GiB, which PDFium decodes in full just to report its size (about
-  // 2 GiB resident at the peak). Under a 1 GiB worker address-space limit
-  // the decode fails inside the worker, which dies; the call ends
-  // UNAVAILABLE, no worker ever holds more than the limit, and the pool
-  // serves again.
+  // 2 GiB resident at the peak). A Parse that does not ask for attachment
+  // data never decodes it and is served whole. One that does: under a 1 GiB
+  // worker address-space limit the decode fails inside the worker, which
+  // dies; the call ends UNAVAILABLE, no worker ever holds more than the
+  // limit, and the pool serves again.
   {
     std::string fixture_dir = argv[2];
     fixture_dir.erase(fixture_dir.rfind('/') + 1);
@@ -756,6 +757,29 @@ int main(int argc, char** argv) {
                                  {"GRPC_PDFIUM_WORKER_MAX_BYTES", "1073741824"}});
     if (front.port > 0 && !bomb.empty()) {
       auto stub = Dial(front.port);
+      {
+        grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(60));
+        pdfv1::ParseRequest request;
+        request.mutable_document()->set_data(bomb);
+        auto reader = stub->Parse(&ctx, request);
+        pdfv1::ParseResponse message;
+        bool saw_trailer = false;
+        int attachments = 0;
+        bool sized = false;
+        while (reader->Read(&message)) {
+          if (message.has_trailer()) saw_trailer = true;
+          if (message.has_attachment()) {
+            ++attachments;
+            sized = sized || message.attachment().has_size_bytes() ||
+                    !message.attachment().data().empty();
+          }
+        }
+        Check(reader->Finish().ok() && saw_trailer,
+              "a default Parse of the bomb is served whole");
+        Check(attachments == 1 && !sized,
+              "the bomb's attachment is listed without decoding it");
+      }
       // Sample the worker's peak resident size while the call runs: a
       // worker that survives keeps its peak, one that dies is read until
       // it goes.
@@ -775,6 +799,7 @@ int main(int argc, char** argv) {
       pdfv1::ParseRequest request;
       request.mutable_document()->set_data(bomb);
       request.add_families(pdfv1::PDF_FAMILY_ATTACHMENTS);
+      request.mutable_options()->set_include_attachment_data(true);
       auto reader = stub->Parse(&ctx, request);
       pdfv1::ParseResponse message;
       bool saw_trailer = false;

@@ -39,9 +39,10 @@ Each worker also runs under an address-space limit,
 `GRPC_PDFIUM_WORKER_MAX_BYTES` (bytes; default 3 GiB, 0 turns it off,
 otherwise at least 256 MiB), with core dumps off. PDFium decodes a stream
 in full, up to 1 GiB, even to report an attachment's size, so a document of
-a few kilobytes of nested Flate can ask for gigabytes; under the limit the
-allocation fails, the worker dies, the call ends `UNAVAILABLE`, and the
-slot is respawned. The default leaves room for a 520 MiB document and a
+a few kilobytes of nested Flate can ask for gigabytes. That decode happens
+only when a Parse sets `include_attachment_data` (so `size_bytes` is left
+unset otherwise); under the limit the allocation fails, the worker dies,
+that call ends `UNAVAILABLE`, and the slot is respawned. The default leaves room for a 520 MiB document and a
 512 MiB raster; lower it when documents and rasters are smaller.
 
 The content-addressed handshake (`PdfDocument.sha256`) is served by the
