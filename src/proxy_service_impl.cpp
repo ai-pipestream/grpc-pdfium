@@ -128,14 +128,15 @@ Settled SettleAttempt(const Forwarding& fwd, const WorkerPool::Lease& lease,
       client_gone || fwd.context->IsCancelled() ||
       status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED;
   const bool failed = abandoned ? !status.ok() : IsWorkerFailure(status);
-  if (fwd.pool->Release(lease, failed)) {
+  const bool cut = fwd.pool->Release(lease, failed);
+  if (abandoned) {
+    return {client_gone || status.ok() ? grpc::Status::CANCELLED : status};
+  }
+  if (cut) {
     return {grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
                          "the worker made no progress for " +
                              std::to_string(fwd.pool->stall_limit().count()) +
                              " s and was stopped")};
-  }
-  if (abandoned) {
-    return {client_gone || status.ok() ? grpc::Status::CANCELLED : status};
   }
   if (!failed) return {status};
   if (forwarded_any) {

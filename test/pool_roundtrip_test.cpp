@@ -575,6 +575,42 @@ int main(int argc, char** argv) {
   }
   StopFront(&front);
 
+  // A worker call still sending a large request to a worker that stopped
+  // reading does not end when its client goes away, so the watchdog kills
+  // the worker of a lease still held after its client left.
+  front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "1"},
+                               {"GRPC_PDFIUM_REQUEST_TIMEOUT_S", "60"},
+                               {"GRPC_PDFIUM_QUEUE_TIMEOUT_S", "60"}});
+  if (front.port > 0) {
+    auto stub = Dial(front.port);
+    const std::string big(16 << 20, 'x');
+    const std::string big_sha = grpc_pdfium::Sha256Hex(big);
+    auto probe_by_hash = [&stub, &big_sha](std::chrono::milliseconds deadline) {
+      grpc::ClientContext ctx;
+      ctx.set_deadline(std::chrono::system_clock::now() + deadline);
+      pdfv1::ProbeRequest request;
+      request.mutable_document()->set_sha256(big_sha);
+      pdfv1::ProbeResponse response;
+      return stub->Probe(&ctx, request, &response);
+    };
+    {
+      grpc::ClientContext ctx;
+      pdfv1::ProbeRequest request;
+      request.mutable_document()->set_data(big);
+      request.mutable_document()->set_sha256(big_sha);
+      pdfv1::ProbeResponse response;
+      Check(stub->Probe(&ctx, request, &response).ok(),
+            "16 MiB document uploaded and cached");
+    }
+    Check(FreezeWorker(front.pid), "large-request worker frozen");
+    Check(probe_by_hash(seconds(2)).error_code() ==
+              grpc::StatusCode::DEADLINE_EXCEEDED,
+          "a large request to a frozen worker runs into its deadline");
+    Check(ProbeWithin(stub.get(), fixture, seconds(20)).ok(),
+          "the pool serves again after the abandoned large request");
+  }
+  StopFront(&front);
+
   // A one-second watchdog: a call that makes no progress has its worker
   // killed and ends DEADLINE_EXCEEDED although its client set no deadline,
   // and the pool recovers on its own.

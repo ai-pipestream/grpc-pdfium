@@ -30,7 +30,7 @@ WorkerPool::WorkerPool(std::string self_exe, std::string socket_dir, int size,
     w.channel = std::move(process.channel);
     w.stub = std::move(process.stub);
   }
-  if (stall_limit_.count() > 0) watchdog_ = std::thread([this] { Watch(); });
+  watchdog_ = std::thread([this] { Watch(); });
 }
 
 WorkerPool::~WorkerPool() {
@@ -103,6 +103,7 @@ WorkerPool::AcquireResult WorkerPool::Acquire(
       w.busy = true;
       w.call = call;
       w.stall_deadline = std::chrono::steady_clock::now() + stall_limit_;
+      w.abandoned = false;
       w.stalled = false;
       w.call_cancelled = false;
       *lease = Lease{static_cast<int>(i), w.stub.get()};
@@ -172,20 +173,40 @@ void WorkerPool::Watch() {
     const auto now = std::chrono::steady_clock::now();
     for (size_t i = 0; i < workers_.size(); ++i) {
       Worker& w = workers_[i];
-      if (w.call == nullptr || now < w.stall_deadline) continue;
-      if (!w.stalled) {
-        // Nothing forwarded for the whole limit: kill the worker. A front
-        // call reading from it fails at once, and Release respawns it.
-        w.stalled = true;
-        w.stall_deadline = now + std::chrono::seconds(1);
-        if (w.pid > 0) kill(w.pid, SIGKILL);
+      if (w.call == nullptr) continue;
+      if (w.stalled) {
+        // Still leased a second after its worker was killed: the front is
+        // blocked writing to a client that stopped reading. Cancelling the
+        // call unblocks it.
+        if (!w.call_cancelled && now >= w.stall_deadline) {
+          w.call_cancelled = true;
+          w.call->TryCancel();
+        }
+        continue;
+      }
+      // A call whose client went away normally ends at once and releases
+      // its worker. One still leased a tick later is stuck on the worker
+      // (a call blocked sending to a worker that stopped reading does not
+      // end on cancellation), so the worker goes.
+      if (w.call->IsCancelled() && !w.abandoned) {
+        w.abandoned = true;
+        continue;
+      }
+      const bool no_progress =
+          stall_limit_.count() > 0 && now >= w.stall_deadline;
+      if (!w.abandoned && !no_progress) continue;
+      // Kill the worker: a front call reading from or writing to it fails
+      // at once, and Release respawns it.
+      w.stalled = true;
+      w.stall_deadline = now + std::chrono::seconds(1);
+      if (w.pid > 0) kill(w.pid, SIGKILL);
+      if (w.abandoned) {
+        std::cerr << "grpc-pdfium: worker " << i
+                  << " still held after its client went away; killed it"
+                  << std::endl;
+      } else {
         std::cerr << "grpc-pdfium: worker " << i << " made no progress for "
                   << stall_limit_.count() << " s; killed it" << std::endl;
-      } else if (!w.call_cancelled) {
-        // Still leased a second later: the front is blocked writing to a
-        // client that stopped reading. Cancelling the call unblocks it.
-        w.call_cancelled = true;
-        w.call->TryCancel();
       }
     }
   }

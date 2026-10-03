@@ -23,11 +23,11 @@ namespace grpc_pdfium {
 // service.
 //
 // A watchdog bounds every lease. A call that forwards nothing for the stall
-// limit has its worker killed, which ends a front call stuck reading from
-// it; if the lease is still held a second later, the front is stuck writing
-// to a client that stopped reading, and the client's call is cancelled.
-// Either way the slot comes back respawned, so no document can hold a
-// worker for good.
+// limit, or that is still leased a second after its client went away, has
+// its worker killed, which ends a front call stuck on it; if the lease is
+// still held a second later, the front is stuck writing to a client that
+// stopped reading, and the client's call is cancelled. Either way the slot
+// comes back respawned, so no document can hold a worker for good.
 class WorkerPool {
  public:
   struct Lease {
@@ -38,7 +38,7 @@ class WorkerPool {
   enum class AcquireResult { kLeased, kTimedOut, kCancelled };
 
   // Spawns size workers running self_exe --worker <socket>. Sockets live
-  // under socket_dir. A stall_limit of zero turns the watchdog off.
+  // under socket_dir. A stall_limit of zero turns the stall check off.
   WorkerPool(std::string self_exe, std::string socket_dir, int size,
              std::chrono::seconds stall_limit);
   ~WorkerPool();
@@ -76,6 +76,8 @@ class WorkerPool {
     grpc::ServerContext* call = nullptr;
     // When the watchdog acts next unless the lease makes progress first.
     std::chrono::steady_clock::time_point stall_deadline;
+    // The watchdog saw the call's client gone while the lease was held.
+    bool abandoned = false;
     // The watchdog killed this lease's worker.
     bool stalled = false;
     // The watchdog cancelled this lease's call.
