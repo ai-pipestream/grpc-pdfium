@@ -4,7 +4,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <list>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -14,6 +17,7 @@
 #include "fpdf_text.h"
 #include "fpdf_transformpage.h"
 #include "fpdfview.h"
+#include "page_space.h"
 #include "pdfium_tier12.h"
 
 namespace grpc_pdfium {
@@ -24,6 +28,11 @@ namespace {
 
 constexpr char kBackendName[] = "grpc-pdfium";
 constexpr char kEngineVersion[] = "pdfium 154.0.8035.0 (chromium/8035)";
+
+// The largest raster Render produces: one PageRaster must fit the fleet's
+// 520 MiB message limit, and the bitmap is allocated before it is filled,
+// so a larger page is refused before any pixel memory is taken.
+constexpr double kMaxRasterBytes = 512.0 * 1024 * 1024;
 
 // UTF-16 (host order, as PDFium emits) to UTF-8, surrogate pairs included.
 // Invalid sequences become U+FFFD rather than dropping text silently.
@@ -151,32 +160,181 @@ void FillCapabilities(const LoadedDocument& loaded,
   }
 }
 
-void FillPageInfo(FPDF_DOCUMENT doc, FPDF_PAGE page, int index,
-                  pdfv1::PageInfo* info) {
-  (void)doc;
+void SetBox(pdfv1::BoundingBox* box, float left, float bottom, float right,
+            float top) {
+  box->set_x0(std::min(left, right));
+  box->set_y0(std::min(bottom, top));
+  box->set_x1(std::max(left, right));
+  box->set_y1(std::max(bottom, top));
+}
+
+// /MediaBox, /CropBox and /Rotate are inheritable through the page tree
+// (ISO 32000-1 7.7.3.4), but FPDFPage_GetMediaBox and FPDFPage_GetCropBox
+// read only the page's own dictionary and miss a box set on a /Pages node.
+// FPDF_GetPageBoundingBox is the CropBox the renderer uses: inherited,
+// clipped to the MediaBox (14.11.2) and falling back to it, which is what
+// PageInfo.crop_box names and what the raster covers. Page geometry is
+// reported relative to this box (see page_space.h); the boxes themselves
+// stay as stored.
+void FillPageInfo(FPDF_PAGE page, int index, pdfv1::PageInfo* info) {
   info->set_page_index(static_cast<uint32_t>(index));
+  info->set_page_space(pdfv1::PAGE_SPACE_CROP_BOX);
   info->set_width_pts(FPDF_GetPageWidthF(page));
   info->set_height_pts(FPDF_GetPageHeightF(page));
   info->set_rotation_degrees(FPDFPage_GetRotation(page) * 90);
+  FS_RECTF crop;
+  if (!FPDF_GetPageBoundingBox(page, &crop)) return;
+  SetBox(info->mutable_crop_box(), crop.left, crop.bottom, crop.right,
+         crop.top);
   float left = 0;
   float bottom = 0;
   float right = 0;
   float top = 0;
   if (FPDFPage_GetMediaBox(page, &left, &bottom, &right, &top)) {
-    auto* box = info->mutable_media_box();
-    box->set_x0(left);
-    box->set_y0(bottom);
-    box->set_x1(right);
-    box->set_y1(top);
+    SetBox(info->mutable_media_box(), left, bottom, right, top);
+  } else if (crop.right > crop.left && crop.top > crop.bottom) {
+    // An inherited MediaBox has no getter. Widening the CropBox to all of
+    // user space makes the renderer's box the MediaBox itself; the CropBox
+    // is then set back to the box read above, so the page's effective box
+    // (and anything computed from it later) is unchanged. The edit lives
+    // only in this request's in-memory document.
+    constexpr float kAll = std::numeric_limits<float>::max();
+    FPDFPage_SetCropBox(page, -kAll, -kAll, kAll, kAll);
+    FS_RECTF media;
+    const bool has_media = FPDF_GetPageBoundingBox(page, &media);
+    FPDFPage_SetCropBox(page, crop.left, crop.bottom, crop.right, crop.top);
+    if (has_media) {
+      SetBox(info->mutable_media_box(), media.left, media.bottom, media.right,
+             media.top);
+    }
   }
-  if (FPDFPage_GetCropBox(page, &left, &bottom, &right, &top)) {
-    auto* box = info->mutable_crop_box();
-    box->set_x0(left);
-    box->set_y0(bottom);
-    box->set_x1(right);
-    box->set_y1(top);
-  } else if (info->has_media_box()) {
-    *info->mutable_crop_box() = info->media_box();
+}
+
+// The pages [begin, end) a request selects, clamped to the document. The
+// arithmetic stays unsigned: the services reject ranges the contract
+// forbids, and a range past the last page comes out empty, never negative.
+struct PageSpan {
+  int begin = 0;
+  int end = 0;
+};
+
+PageSpan SelectPages(bool has_range, const pdfv1::PageRange& range,
+                     int page_count) {
+  const uint32_t count = static_cast<uint32_t>(std::max(page_count, 0));
+  if (!has_range) return {0, static_cast<int>(count)};
+  const uint32_t begin = std::min(range.begin(), count);
+  const uint32_t end = std::max(begin, std::min(range.end(), count));
+  return {static_cast<int>(begin), static_cast<int>(end)};
+}
+
+// Pages loaded in this process; see PdfiumEngine::PageLoads.
+uint64_t page_loads = 0;
+
+// A loaded page, closed when it goes out of scope. FPDF_LoadPage parses the
+// page's content stream, the expensive part of touching a page, so every
+// load in the engine goes through here and is counted.
+class ScopedPage {
+ public:
+  ScopedPage(FPDF_DOCUMENT doc, int index) : page_(FPDF_LoadPage(doc, index)) {
+    ++page_loads;
+  }
+  ~ScopedPage() {
+    if (page_ != nullptr) FPDF_ClosePage(page_);
+  }
+  ScopedPage(const ScopedPage&) = delete;
+  ScopedPage& operator=(const ScopedPage&) = delete;
+
+  FPDF_PAGE get() const { return page_; }
+
+ private:
+  FPDF_PAGE page_;
+};
+
+// The page inventories of recently parsed documents. Every Parse header
+// carries the whole inventory, and PDFium exposes /Rotate and the page
+// boxes only on a loaded page, so building one costs a load of every page.
+// A client that parses a long document one page per call (gRParse does)
+// would pay that on every call; with the cache a worker pays it once per
+// document.
+//
+// The key is PdfDocument.sha256 as the front forwards it. The front checks
+// a hash that comes with bytes and fills a hash-only request from the bytes
+// it cached under that very hash, so within the pool the hash names these
+// bytes. The byte size and page count must match too, so a direct caller
+// with a wrong hash is not served another document's inventory.
+//
+// Same threading rule as the rest of the engine: one call at a time.
+class InventoryCache {
+ public:
+  using Pages = google::protobuf::RepeatedPtrField<pdfv1::PageInfo>;
+
+  const Pages* Find(const std::string& sha256, size_t size_bytes,
+                    int page_count) {
+    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+      if (it->sha256 != sha256) continue;
+      if (it->size_bytes != size_bytes || it->page_count != page_count) {
+        return nullptr;
+      }
+      entries_.splice(entries_.begin(), entries_, it);
+      return &entries_.front().pages;
+    }
+    return nullptr;
+  }
+
+  void Insert(const std::string& sha256, size_t size_bytes, int page_count,
+              const Pages& pages) {
+    if (pages.size() > kMaxPages) return;
+    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+      if (it->sha256 == sha256) {
+        total_pages_ -= it->pages.size();
+        entries_.erase(it);
+        break;
+      }
+    }
+    while (!entries_.empty() &&
+           (entries_.size() >= kMaxDocuments ||
+            total_pages_ + pages.size() > kMaxPages)) {
+      total_pages_ -= entries_.back().pages.size();
+      entries_.pop_back();
+    }
+    entries_.push_front(Entry{sha256, size_bytes, page_count, pages});
+    total_pages_ += pages.size();
+  }
+
+ private:
+  // About 200 bytes per page: a few tens of MB at the ceiling.
+  static constexpr size_t kMaxDocuments = 8;
+  static constexpr int kMaxPages = 100000;
+
+  struct Entry {
+    std::string sha256;
+    size_t size_bytes;
+    int page_count;
+    Pages pages;
+  };
+  std::list<Entry> entries_;  // front is most recently used
+  int total_pages_ = 0;
+};
+
+// Fills the header inventory: every page's PageInfo, from the cache when
+// the document hash is known, else by loading each page in turn (one page
+// open at a time).
+void FillInventory(FPDF_DOCUMENT doc, const pdfv1::PdfDocument& document,
+                   int page_count, InventoryCache::Pages* pages) {
+  static InventoryCache cache;
+  if (document.has_sha256()) {
+    if (const auto* cached =
+            cache.Find(document.sha256(), document.data().size(), page_count)) {
+      *pages = *cached;
+      return;
+    }
+  }
+  for (int i = 0; i < page_count; ++i) {
+    ScopedPage page(doc, i);
+    if (page.get() != nullptr) FillPageInfo(page.get(), i, pages->Add());
+  }
+  if (document.has_sha256()) {
+    cache.Insert(document.sha256(), document.data().size(), page_count, *pages);
   }
 }
 
@@ -194,7 +352,9 @@ bool IsWordBreak(unsigned short unit) {
 // take the union of the text rects each word occupies, and read font
 // identity from the word's first character.
 void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
-                      FontInterner* fonts, pdfv1::FontTableChunk* new_fonts,
+                      bool want_programs, FontInterner* fonts,
+                      pdfv1::FontTableChunk* new_fonts,
+                      std::vector<pdfv1::EmbeddedFont>* embedded_fonts,
                       uint64_t* cell_count) {
   FPDF_TEXTPAGE text_page = FPDFText_LoadPage(page);
   if (text_page == nullptr) return;
@@ -271,25 +431,27 @@ void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
     quad->set_y3(y1);
 
     cell->set_font_size(FPDFText_GetFontSize(text_page, word_start));
-    char name_buf[256];
-    int flags = 0;
-    unsigned long name_len = FPDFText_GetFontInfo(
-        text_page, word_start, name_buf, sizeof(name_buf), &flags);
-    if (name_len > 0) {
-      std::string name(name_buf,
-                       std::min<unsigned long>(name_len, sizeof(name_buf)));
-      // The reported length includes the trailing NUL.
-      while (!name.empty() && name.back() == '\0') name.pop_back();
-      bool is_new = false;
-      uint32_t id = fonts->Intern(name, flags, &is_new);
-      cell->set_font_id(id);
-      if (is_new) {
-        auto* ref = new_fonts->add_fonts();
-        ref->set_font_id(id);
-        ref->set_base_name(name);
-        ref->set_descriptor_flags(static_cast<uint32_t>(flags));
-        // Embedded-program presence lands with the tier 1 font work; the
-        // tier 0 table reports identity and descriptor flags only.
+    // Font and render mode come from the text object that draws the word's
+    // first character: the same font handle the page-object walk sees, so
+    // the cell's font_id is the entry that carries the embedded program.
+    FPDF_PAGEOBJECT text_object = FPDFText_GetTextObject(text_page, word_start);
+    if (std::optional<uint32_t> font_id = tier12::InternCharFont(
+            text_page, word_start, text_object, want_programs, fonts,
+            new_fonts, embedded_fonts)) {
+      cell->set_font_id(*font_id);
+    }
+    if (text_object != nullptr) {
+      // Tr 0..7 map onto the contract's modes one up; Tr 3 is the invisible
+      // OCR underlay.
+      static_assert(pdfv1::TEXT_RENDERING_MODE_FILL ==
+                    FPDF_TEXTRENDERMODE_FILL + 1);
+      static_assert(pdfv1::TEXT_RENDERING_MODE_CLIP ==
+                    FPDF_TEXTRENDERMODE_CLIP + 1);
+      const FPDF_TEXT_RENDERMODE mode =
+          FPDFTextObj_GetTextRenderMode(text_object);
+      if (mode >= FPDF_TEXTRENDERMODE_FILL && mode <= FPDF_TEXTRENDERMODE_CLIP) {
+        cell->set_rendering_mode(
+            static_cast<pdfv1::TextRenderingMode>(mode + 1));
       }
     }
     ++*cell_count;
@@ -313,6 +475,8 @@ const char* PdfiumEngine::BackendName() { return kBackendName; }
 
 const char* PdfiumEngine::EngineVersion() { return kEngineVersion; }
 
+uint64_t PdfiumEngine::PageLoads() { return page_loads; }
+
 void PdfiumEngine::Probe(const pdfv1::PdfDocument& document,
                          pdfv1::BackendCapabilities* caps) {
   LoadedDocument loaded;
@@ -329,33 +493,23 @@ bool PdfiumEngine::Parse(
   pdfv1::ParseResponse header_msg;
   auto* header = header_msg.mutable_header();
   FillCapabilities(loaded, header->mutable_capabilities());
-  int page_count =
+  const int page_count =
       loaded.status == pdfv1::LOAD_STATUS_OK ? FPDF_GetPageCount(loaded.doc) : 0;
-  std::vector<FPDF_PAGE> pages(static_cast<size_t>(page_count), nullptr);
-  for (int i = 0; i < page_count; ++i) {
-    pages[static_cast<size_t>(i)] = FPDF_LoadPage(loaded.doc, i);
-    if (pages[static_cast<size_t>(i)] != nullptr) {
-      FillPageInfo(loaded.doc, pages[static_cast<size_t>(i)], i,
-                   header->add_pages());
-    }
+  if (loaded.status == pdfv1::LOAD_STATUS_OK) {
+    FillInventory(loaded.doc, request.document(), page_count,
+                  header->mutable_pages());
   }
   bool client_ok = emit(header_msg);
-  if (!client_ok || loaded.status != pdfv1::LOAD_STATUS_OK) {
-    for (FPDF_PAGE p : pages) {
-      if (p != nullptr) FPDF_ClosePage(p);
-    }
-    return client_ok;
-  }
+  if (!client_ok || loaded.status != pdfv1::LOAD_STATUS_OK) return client_ok;
 
-  int begin = 0;
-  int end = page_count;
-  if (request.has_pages()) {
-    begin = std::min<int>(static_cast<int>(request.pages().begin()), page_count);
-    end = std::min<int>(static_cast<int>(request.pages().end()), page_count);
-  }
+  const PageSpan span =
+      SelectPages(request.has_pages(), request.pages(), page_count);
 
+  const CropOrigins origins = CropOriginsOf(header->pages());
   const tier12::DocFacts facts = tier12::GatherDocFacts(loaded.doc);
-  client_ok = tier12::EmitDocLevelFamilies(loaded.doc, request, facts, emit);
+  std::vector<pdfv1::ParseWarning> warnings;
+  client_ok = tier12::EmitDocLevelFamilies(loaded.doc, request, facts, origins,
+                                           emit, &warnings);
 
   // Form-field access goes through a form-fill environment; a zeroed
   // struct with just the version is the read-only setup.
@@ -369,11 +523,16 @@ bool PdfiumEngine::Parse(
 
   const bool want_text =
       tier12::WantFamily(request, pdfv1::PDF_FAMILY_TEXT_CELLS);
+  const bool want_programs =
+      tier12::WantFamily(request, pdfv1::PDF_FAMILY_EMBEDDED_FONTS);
   FontInterner fonts;
   std::map<pdfv1::PdfFamily, uint64_t> counts;
   counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] = static_cast<uint64_t>(page_count);
-  for (int i = begin; client_ok && i < end; ++i) {
-    FPDF_PAGE page = pages[static_cast<size_t>(i)];
+  // Only the requested pages are loaded, one at a time, each closed once
+  // its messages are out.
+  for (int i = span.begin; client_ok && i < span.end; ++i) {
+    ScopedPage loaded_page(loaded.doc, i);
+    FPDF_PAGE page = loaded_page.get();
     if (page == nullptr) continue;
     pdfv1::ParseResponse page_msg;
     auto* chunk = page_msg.mutable_page();
@@ -381,11 +540,12 @@ bool PdfiumEngine::Parse(
     pdfv1::FontTableChunk new_fonts;
     std::vector<pdfv1::EmbeddedFont> embedded_fonts;
     if (want_text) {
-      ExtractTextCells(page, chunk, &fonts, &new_fonts,
-                       &counts[pdfv1::PDF_FAMILY_TEXT_CELLS]);
+      ExtractTextCells(page, chunk, want_programs, &fonts, &new_fonts,
+                       &embedded_fonts, &counts[pdfv1::PDF_FAMILY_TEXT_CELLS]);
     }
     tier12::ExtractPageTier12(loaded.doc, page, form_handle, request, &fonts,
-                              chunk, &new_fonts, &embedded_fonts);
+                              chunk, &new_fonts, &embedded_fonts, &warnings);
+    ShiftToCropSpace(origins, chunk);
     counts[pdfv1::PDF_FAMILY_PLACED_IMAGES] += chunk->images_size();
     counts[pdfv1::PDF_FAMILY_HYPERLINKS] += chunk->hyperlinks_size();
     counts[pdfv1::PDF_FAMILY_ANNOTATIONS] += chunk->annotations_size();
@@ -410,16 +570,22 @@ bool PdfiumEngine::Parse(
     }
   }
 
+  // The structure tree is a document-level family, so the page range does
+  // not apply; PDFium builds it per page, so each page is loaded in turn.
   if (client_ok && facts.tagged &&
       tier12::WantFamily(request, pdfv1::PDF_FAMILY_STRUCT_TREE)) {
-    client_ok = tier12::EmitStructTree(
-        pages, emit, &counts[pdfv1::PDF_FAMILY_STRUCT_TREE]);
+    pdfv1::ParseResponse tree_msg;
+    auto* tree = tree_msg.mutable_struct_tree();
+    for (int i = 0; i < page_count; ++i) {
+      ScopedPage page(loaded.doc, i);
+      if (page.get() == nullptr) continue;
+      tier12::AppendStructTree(page.get(), static_cast<uint32_t>(i), tree,
+                               &counts[pdfv1::PDF_FAMILY_STRUCT_TREE]);
+    }
+    if (tree->roots_size() > 0) client_ok = emit(tree_msg);
   }
 
   if (form_handle != nullptr) FPDFDOC_ExitFormFillEnvironment(form_handle);
-  for (FPDF_PAGE p : pages) {
-    if (p != nullptr) FPDF_ClosePage(p);
-  }
   if (!client_ok) return false;
 
   pdfv1::ParseResponse trailer_msg;
@@ -429,49 +595,57 @@ bool PdfiumEngine::Parse(
     entry->set_family(family);
     entry->set_count(count);
   }
+  for (auto& warning : warnings) *trailer->add_warnings() = std::move(warning);
   return emit(trailer_msg);
 }
 
-bool PdfiumEngine::Render(
+grpc::Status PdfiumEngine::Render(
     const pdfv1::RenderRequest& request,
-    const std::function<bool(const pdfv1::RenderResponse&)>& emit,
-    std::string* error_message) {
-  if (request.dpi() <= 0.0) {
-    *error_message = "dpi must be positive";
-    return false;
-  }
+    const std::function<bool(const pdfv1::RenderResponse&)>& emit) {
   LoadedDocument loaded;
   LoadDocument(request.document(), &loaded);
   if (loaded.status != pdfv1::LOAD_STATUS_OK) {
-    *error_message = "document did not load: " +
-                     pdfv1::LoadStatus_Name(loaded.status) +
-                     (loaded.detail.empty() ? "" : " (" + loaded.detail + ")");
-    return false;
+    // A load failure is typed in the stream head, never a bare gRPC error:
+    // exactly one message, then the stream ends.
+    pdfv1::RenderResponse msg;
+    auto* head = msg.mutable_head();
+    head->set_load_status(loaded.status);
+    if (!loaded.detail.empty()) head->set_load_detail(loaded.detail);
+    return emit(msg) ? grpc::Status::OK : grpc::Status::CANCELLED;
   }
 
-  int page_count = FPDF_GetPageCount(loaded.doc);
-  int begin = 0;
-  int end = page_count;
-  if (request.has_pages()) {
-    begin = std::min<int>(static_cast<int>(request.pages().begin()), page_count);
-    end = std::min<int>(static_cast<int>(request.pages().end()), page_count);
-  }
+  const PageSpan span = SelectPages(request.has_pages(), request.pages(),
+                                    FPDF_GetPageCount(loaded.doc));
 
   const bool gray = request.pixel_format() == pdfv1::PIXEL_FORMAT_GRAY8;
   const double scale = request.dpi() / 72.0;
-  for (int i = begin; i < end; ++i) {
-    FPDF_PAGE page = FPDF_LoadPage(loaded.doc, i);
+  for (int i = span.begin; i < span.end; ++i) {
+    ScopedPage loaded_page(loaded.doc, i);
+    FPDF_PAGE page = loaded_page.get();
     if (page == nullptr) continue;
-    int width = std::max(1, static_cast<int>(
-                                std::lround(FPDF_GetPageWidthF(page) * scale)));
-    int height = std::max(
-        1, static_cast<int>(std::lround(FPDF_GetPageHeightF(page) * scale)));
+    // Size the raster in floating point and check it against the ceiling
+    // before any int conversion or allocation. PDFium pads rows to 4 bytes.
+    const double width_px =
+        std::max(1.0, std::round(FPDF_GetPageWidthF(page) * scale));
+    const double height_px =
+        std::max(1.0, std::round(FPDF_GetPageHeightF(page) * scale));
+    const double row_bytes = std::ceil(width_px * (gray ? 1 : 3) / 4.0) * 4.0;
+    if (!(row_bytes * height_px <= kMaxRasterBytes)) {
+      return grpc::Status(
+          grpc::StatusCode::RESOURCE_EXHAUSTED,
+          "page " + std::to_string(i) + " at " + std::to_string(request.dpi()) +
+              " DPI is " + std::to_string(static_cast<int64_t>(width_px)) + "x" +
+              std::to_string(static_cast<int64_t>(height_px)) +
+              " pixels, above the 512 MiB raster limit");
+    }
+    const int width = static_cast<int>(width_px);
+    const int height = static_cast<int>(height_px);
     FPDF_BITMAP bitmap = FPDFBitmap_CreateEx(
         width, height, gray ? FPDFBitmap_Gray : FPDFBitmap_BGR, nullptr, 0);
     if (bitmap == nullptr) {
-      FPDF_ClosePage(page);
-      *error_message = "bitmap allocation failed for page " + std::to_string(i);
-      return false;
+      return grpc::Status(
+          grpc::StatusCode::RESOURCE_EXHAUSTED,
+          "bitmap allocation failed for page " + std::to_string(i));
     }
     // Background: opaque white unless the request sets one. Gray output
     // collapses the color to its luma via the blue channel of FillRect's
@@ -503,10 +677,9 @@ bool PdfiumEngine::Render(
     raster->set_pixels(FPDFBitmap_GetBuffer(bitmap),
                        static_cast<size_t>(stride) * height);
     FPDFBitmap_Destroy(bitmap);
-    FPDF_ClosePage(page);
-    if (!emit(msg)) return false;
+    if (!emit(msg)) return grpc::Status::CANCELLED;
   }
-  return true;
+  return grpc::Status::OK;
 }
 
 }  // namespace grpc_pdfium

@@ -23,6 +23,28 @@ runs as a pool of single-threaded worker processes behind a gRPC front
 unix sockets, die with the front (`PR_SET_PDEATHSIG`), and a crash on a
 hostile document costs one worker, which is respawned.
 
+No request can hold a worker for good. A worker call inherits its client's
+deadline and cancellation, and a call the client abandons kills its worker,
+which is respawned. A request waits for a free worker no longer than its
+client does, nor than `GRPC_PDFIUM_QUEUE_TIMEOUT_S` (default 300), and then
+fails `RESOURCE_EXHAUSTED`. A watchdog kills a worker whose call forwards
+nothing for `GRPC_PDFIUM_REQUEST_TIMEOUT_S` (default 300); that call ends
+`DEADLINE_EXCEEDED`, or `CANCELLED` when the front was stuck writing to a
+client that stopped reading (the watchdog cancels that call), and the slot
+comes back respawned. 0 turns either limit
+off; each takes whole seconds up to 604800 (a week), and any other value
+stops the service at startup.
+
+Each worker also runs under an address-space limit,
+`GRPC_PDFIUM_WORKER_MAX_BYTES` (bytes; default 3 GiB, 0 turns it off,
+otherwise at least 256 MiB), with core dumps off. PDFium decodes a stream
+in full, up to 1 GiB, even to report an attachment's size, so a document of
+a few kilobytes of nested Flate can ask for gigabytes. That decode happens
+only when a Parse sets `include_attachment_data` (so `size_bytes` is left
+unset otherwise); under the limit the allocation fails, the worker dies,
+that call ends `UNAVAILABLE`, and the slot is respawned. The default leaves room for a 520 MiB document and a
+512 MiB raster; lower it when documents and rasters are smaller.
+
 The content-addressed handshake (`PdfDocument.sha256`) is served by the
 front process, which owns the client-facing wire: it verifies a supplied
 hash against the bytes (a mismatch answers `LOAD_STATUS_HASH_MISMATCH`),
@@ -30,11 +52,26 @@ caches verified bytes, and answers hash-only lookups from the cache (a miss
 answers `LOAD_STATUS_BYTES_REQUIRED`). Both verdicts are typed on each
 RPC's own surface: `ProbeResponse.capabilities`, the `Parse` header, the
 `RenderResponse` head. Workers always receive full bytes over their unix
-sockets and stay stateless, so a worker respawn never loses cached content.
-The cache is an in-memory LRU bounded by document count
+sockets and keep no document bytes, so a worker respawn never loses cached
+content. The cache is an in-memory LRU bounded by document count
 (`GRPC_PDFIUM_CACHE_MAX_DOCUMENTS`, default 8; 0 disables) and by total
 bytes (`GRPC_PDFIUM_CACHE_MAX_BYTES`, default 2 GiB). Hashes come from the
 boringssl the gRPC build already carries.
+
+`Parse` loads only the pages its range selects, one at a time. Its header
+still lists every page, and PDFium reads page boxes and rotation only from
+a loaded page, so each worker remembers the page inventory of the last few
+documents it parsed, keyed by the same hash; a client that parses one page
+per call pays a load of every page once per document, not once per call.
+
+Page geometry follows the contract frame: PDF user space before `/Rotate`,
+shifted so the CropBox's bottom-left corner is (0, 0). That holds for text
+cells and their quads, images, vector shapes, links, annotations, form
+widgets, and link and outline destinations (which use the frame of the page
+they target). Every `PageInfo` says so with `page_space =
+PAGE_SPACE_CROP_BOX`; its `media_box` and `crop_box` stay as stored. PDFium
+reports user space, so the engine shifts each finished page chunk once
+(`src/page_space.*`).
 
 ## Build and test
 

@@ -15,6 +15,7 @@
 #include "fpdf_structtree.h"
 #include "fpdf_thumbnail.h"
 #include "fpdf_transformpage.h"
+#include "utf8.h"
 
 namespace grpc_pdfium {
 
@@ -36,6 +37,33 @@ uint32_t FontInterner::Intern(const std::string& name, int flags,
 
 namespace tier12 {
 namespace {
+
+// Payload ceilings. A Parse message must fit the fleet's 520 MiB limit, and
+// decoding is where a hostile document turns a few bytes into gigabytes.
+// An image's size is its declared pixel size, checked before PDFium decodes
+// anything. An attachment's size is not: FPDFAttachment_GetFile decodes the
+// whole stream (up to 1 GiB) just to report it, so it runs only when the
+// request asked for attachment data, and the ceiling below only keeps
+// oversized bytes out of the message and spares a copy. What bounds that
+// decode is the worker's address-space limit
+// (GRPC_PDFIUM_WORKER_MAX_BYTES, main.cpp): a bomb costs one worker.
+//
+// One placed image's pixels, decoded (sized at 4 bytes per pixel, the
+// widest layout BitmapToEncodedImage can produce).
+constexpr uint64_t kMaxImageDecodeBytes = 256ull << 20;
+// All decoded image pixels in one page's chunk.
+constexpr uint64_t kMaxPageImageBytes = 384ull << 20;
+// One attachment's bytes (each attachment is its own message).
+constexpr uint64_t kMaxAttachmentBytes = 256ull << 20;
+
+void Warn(std::vector<pdfv1::ParseWarning>* warnings,
+          std::optional<uint32_t> page_index, pdfv1::PdfFamily family,
+          std::string message) {
+  auto& warning = warnings->emplace_back();
+  if (page_index.has_value()) warning.set_page_index(*page_index);
+  warning.set_family(family);
+  warning.set_message(std::move(message));
+}
 
 // UTF-16LE little helper for the many two-call length-then-fill APIs.
 // Returns UTF-8; empty when the value is absent.
@@ -102,6 +130,49 @@ void SetBox(pdfv1::BoundingBox* box, float l, float b, float r, float t) {
   box->set_y0(std::min(b, t));
   box->set_x1(std::max(l, r));
   box->set_y1(std::max(b, t));
+}
+
+// Affine maps in PDF's row-vector convention: a point (x, y) goes to
+// (a x + c y + e, b x + d y + f).
+constexpr FS_MATRIX kIdentity{1, 0, 0, 1, 0, 0};
+
+FS_POINTF Apply(const FS_MATRIX& m, float x, float y) {
+  return {m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f};
+}
+
+// first, then second.
+FS_MATRIX Concat(const FS_MATRIX& first, const FS_MATRIX& second) {
+  return {first.a * second.a + first.b * second.c,
+          first.a * second.b + first.b * second.d,
+          first.c * second.a + first.d * second.c,
+          first.c * second.b + first.d * second.d,
+          first.e * second.a + first.f * second.c + second.e,
+          first.e * second.b + first.f * second.d + second.f};
+}
+
+// The page-space bounds of an object whose bounds PDFium reports in its
+// parent's space (the page, or the enclosing Form XObject's space).
+bool SetPageBounds(FPDF_PAGEOBJECT obj, const FS_MATRIX& to_page,
+                   pdfv1::BoundingBox* box) {
+  float l = 0;
+  float b = 0;
+  float r = 0;
+  float t = 0;
+  if (!FPDFPageObj_GetBounds(obj, &l, &b, &r, &t)) return false;
+  const FS_POINTF corners[] = {Apply(to_page, l, b), Apply(to_page, r, b),
+                               Apply(to_page, r, t), Apply(to_page, l, t)};
+  float x0 = corners[0].x;
+  float y0 = corners[0].y;
+  float x1 = x0;
+  float y1 = y0;
+  for (const FS_POINTF& c : corners) {
+    x0 = std::min(x0, c.x);
+    y0 = std::min(y0, c.y);
+    x1 = std::max(x1, c.x);
+    y1 = std::max(y1, c.y);
+  }
+  SetBox(box, x0, y0, x1, y1);
+  return true;
 }
 
 void FillDestination(FPDF_DOCUMENT doc, FPDF_DEST dest,
@@ -195,7 +266,8 @@ void FillOutline(FPDF_DOCUMENT doc, FPDF_BOOKMARK bookmark,
 }
 
 bool EmitAttachments(FPDF_DOCUMENT doc, bool include_data,
-                     const std::function<bool(const pdfv1::ParseResponse&)>& emit) {
+                     const std::function<bool(const pdfv1::ParseResponse&)>& emit,
+                     std::vector<pdfv1::ParseWarning>* warnings) {
   int count = FPDFDoc_GetAttachmentCount(doc);
   for (int i = 0; i < count; ++i) {
     FPDF_ATTACHMENT att = FPDFDoc_GetAttachment(doc, i);
@@ -223,15 +295,26 @@ bool EmitAttachments(FPDF_DOCUMENT doc, bool include_data,
         }
       }
     }
+    // FPDFAttachment_GetFile decodes the whole stream to report its size,
+    // and PDFium has no public reader for the recorded /Params /Size, so
+    // the size is only known (and the optional size_bytes only set) when
+    // the data was asked for. A Parse that did not ask never decodes an
+    // attachment, so a bomb fails only the request that wanted its bytes.
     unsigned long size = 0;
-    if (FPDFAttachment_GetFile(att, nullptr, 0, &size) && size > 0) {
+    if (include_data && FPDFAttachment_GetFile(att, nullptr, 0, &size) &&
+        size > 0) {
       meta->set_size_bytes(size);
-      if (include_data) {
+      if (size > kMaxAttachmentBytes) {
+        Warn(warnings, std::nullopt, pdfv1::PDF_FAMILY_ATTACHMENTS,
+             "attachment " + meta->name() + " data left out: " +
+                 std::to_string(size) + " bytes is above the " +
+                 std::to_string(kMaxAttachmentBytes >> 20) + " MiB limit");
+      } else {
         std::string data(size, '\0');
         unsigned long got = 0;
         if (FPDFAttachment_GetFile(att, data.data(), size, &got)) {
-          data.resize(got);
-          meta->set_data(data);
+          data.resize(std::min(got, size));
+          meta->set_data(std::move(data));
         }
       }
     }
@@ -494,20 +577,25 @@ void FillFormFields(FPDF_FORMHANDLE handle, FPDF_PAGE page,
   }
 }
 
-void FillQuadFromRotatedBounds(FPDF_PAGEOBJECT obj, pdfv1::Quad* quad,
+void FillQuadFromRotatedBounds(FPDF_PAGEOBJECT obj, const FS_MATRIX& to_page,
+                               pdfv1::Quad* quad,
                                const pdfv1::BoundingBox& fallback) {
   FS_QUADPOINTSF pts;
   if (FPDFPageObj_GetRotatedBounds(obj, &pts)) {
     // Rotated bounds arrive as the four corners in drawing order; map to
     // the contract's lower-left-first convention via the bounding order.
-    quad->set_x0(pts.x1);
-    quad->set_y0(pts.y1);
-    quad->set_x1(pts.x2);
-    quad->set_y1(pts.y2);
-    quad->set_x2(pts.x3);
-    quad->set_y2(pts.y3);
-    quad->set_x3(pts.x4);
-    quad->set_y3(pts.y4);
+    const FS_POINTF p1 = Apply(to_page, pts.x1, pts.y1);
+    const FS_POINTF p2 = Apply(to_page, pts.x2, pts.y2);
+    const FS_POINTF p3 = Apply(to_page, pts.x3, pts.y3);
+    const FS_POINTF p4 = Apply(to_page, pts.x4, pts.y4);
+    quad->set_x0(p1.x);
+    quad->set_y0(p1.y);
+    quad->set_x1(p2.x);
+    quad->set_y1(p2.y);
+    quad->set_x2(p3.x);
+    quad->set_y2(p3.y);
+    quad->set_x3(p4.x);
+    quad->set_y3(p4.y);
     return;
   }
   quad->set_x0(fallback.x0());
@@ -575,7 +663,7 @@ bool BitmapToEncodedImage(FPDF_BITMAP bitmap, pdfv1::EncodedImage* out) {
       out->set_width_px(static_cast<uint32_t>(width));
       out->set_height_px(static_cast<uint32_t>(height));
       out->set_stride_bytes(static_cast<uint32_t>(width * 3));
-      out->set_data(pixels);
+      out->set_data(std::move(pixels));
       return true;
     }
     default:
@@ -593,22 +681,52 @@ bool BitmapToEncodedImage(FPDF_BITMAP bitmap, pdfv1::EncodedImage* out) {
         reinterpret_cast<const char*>(buffer + static_cast<size_t>(y) * stride),
         static_cast<size_t>(width) * bytes_per_pixel);
   }
-  out->set_data(pixels);
+  out->set_data(std::move(pixels));
   return true;
 }
 
-void FillImage(FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_PAGEOBJECT obj,
-               bool include_data, pdfv1::PageChunk* chunk) {
-  (void)doc;
-  auto* image = chunk->add_images();
-  float l = 0;
-  float b = 0;
-  float r = 0;
-  float t = 0;
-  if (FPDFPageObj_GetBounds(obj, &l, &b, &r, &t)) {
-    SetBox(image->mutable_bbox(), l, b, r, t);
+// Decodes an image's pixels into image->image when they fit the decode
+// limits, counting them against the page's budget; otherwise leaves them
+// out with a warning. The size check reads the image's declared pixel size,
+// before PDFium allocates anything.
+void FillImageData(FPDF_PAGEOBJECT obj, pdfv1::PlacedImage* image,
+                   uint32_t page_index, uint64_t* page_image_bytes,
+                   std::vector<pdfv1::ParseWarning>* warnings) {
+  unsigned int width = 0;
+  unsigned int height = 0;
+  if (!FPDFImageObj_GetImagePixelSize(obj, &width, &height)) return;
+  // Two 32-bit factors cannot overflow 64 bits; the factor of 4 is applied
+  // only below the limit.
+  const uint64_t pixels = uint64_t{width} * height;
+  if (pixels > kMaxImageDecodeBytes / 4) {
+    Warn(warnings, page_index, pdfv1::PDF_FAMILY_PLACED_IMAGES,
+         "image data left out: " + std::to_string(width) + "x" +
+             std::to_string(height) + " pixels is above the " +
+             std::to_string(kMaxImageDecodeBytes >> 20) + " MiB decode limit");
+    return;
   }
-  FillQuadFromRotatedBounds(obj, image->mutable_quad(), image->bbox());
+  const uint64_t decoded = pixels * 4;
+  if (*page_image_bytes + decoded > kMaxPageImageBytes) {
+    Warn(warnings, page_index, pdfv1::PDF_FAMILY_PLACED_IMAGES,
+         "image data left out: the page's decoded images pass the " +
+             std::to_string(kMaxPageImageBytes >> 20) + " MiB limit");
+    return;
+  }
+  FPDF_BITMAP bitmap = FPDFImageObj_GetBitmap(obj);
+  if (bitmap == nullptr) return;
+  if (BitmapToEncodedImage(bitmap, image->mutable_image())) {
+    *page_image_bytes += image->image().data().size();
+  }
+  FPDFBitmap_Destroy(bitmap);
+}
+
+void FillImage(FPDF_PAGE page, FPDF_PAGEOBJECT obj, const FS_MATRIX& to_page,
+               bool include_data, uint64_t* page_image_bytes,
+               pdfv1::PageChunk* chunk,
+               std::vector<pdfv1::ParseWarning>* warnings) {
+  auto* image = chunk->add_images();
+  SetPageBounds(obj, to_page, image->mutable_bbox());
+  FillQuadFromRotatedBounds(obj, to_page, image->mutable_quad(), image->bbox());
   FPDF_IMAGEOBJ_METADATA meta;
   if (FPDFImageObj_GetImageMetadata(obj, page, &meta)) {
     image->set_source_width_px(meta.width);
@@ -619,21 +737,20 @@ void FillImage(FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_PAGEOBJECT obj,
     }
   }
   if (include_data) {
-    FPDF_BITMAP bitmap = FPDFImageObj_GetBitmap(obj);
-    if (bitmap != nullptr) {
-      BitmapToEncodedImage(bitmap, image->mutable_image());
-      FPDFBitmap_Destroy(bitmap);
-    }
+    FillImageData(obj, image, chunk->page_index(), page_image_bytes, warnings);
   }
 }
 
-void FillShape(FPDF_PAGEOBJECT obj, pdfv1::PageChunk* chunk) {
+void FillShape(FPDF_PAGEOBJECT obj, const FS_MATRIX& to_page,
+               pdfv1::PageChunk* chunk) {
   auto* shape = chunk->add_shapes();
-  FS_MATRIX m{1, 0, 0, 1, 0, 0};
+  FS_MATRIX m = kIdentity;
   FPDFPageObj_GetMatrix(obj, &m);
+  m = Concat(m, to_page);
   auto transform = [&m](float x, float y, pdfv1::PathPoint* out) {
-    out->set_x(m.a * x + m.c * y + m.e);
-    out->set_y(m.b * x + m.d * y + m.f);
+    const FS_POINTF p = Apply(m, x, y);
+    out->set_x(p.x);
+    out->set_y(p.y);
   };
   int segments = FPDFPath_CountSegments(obj);
   int bezier_phase = 0;
@@ -713,48 +830,127 @@ void FillShape(FPDF_PAGEOBJECT obj, pdfv1::PageChunk* chunk) {
   }
   float width = 0;
   if (FPDFPageObj_GetStrokeWidth(obj, &width)) shape->set_line_width(width);
-  float l = 0;
-  float b = 0;
-  float r = 0;
-  float t = 0;
-  if (FPDFPageObj_GetBounds(obj, &l, &b, &r, &t)) {
-    SetBox(shape->mutable_bbox(), l, b, r, t);
-  }
+  SetPageBounds(obj, to_page, shape->mutable_bbox());
 }
 
-void FillEmbeddedFontsFromObject(
-    FPDF_PAGEOBJECT obj, FontInterner* fonts,
-    pdfv1::FontTableChunk* new_fonts,
-    std::vector<pdfv1::EmbeddedFont>* embedded_fonts) {
-  FPDF_FONT font = FPDFTextObj_GetFont(obj);
-  if (font == nullptr) return;
-  char name_buf[256];
-  size_t name_len = FPDFFont_GetBaseFontName(font, name_buf, sizeof(name_buf));
-  if (name_len == 0) return;
-  std::string name(name_buf);
-  int flags = FPDFFont_GetFlags(font);
+// FPDFText_GetFontInfo reports PDFium's internal font flags; the descriptor
+// bits ISO 32000-1 table 123 defines (what FPDFFont_GetFlags reports) are
+// the low 19.
+constexpr int kDescriptorFlagBits = 0x7FFFF;
+
+// Interns a font. The first time a font is seen, its complete table entry
+// (base name, family, descriptor flags, whether a program is embedded) goes
+// into new_fonts and, when want_program is set, its embedded program into
+// embedded_fonts, so whichever path meets a font first leaves nothing for
+// the other to add. The interner keys on the raw name bytes; only the
+// names written into the table are made valid UTF-8 (ValidUtf8).
+uint32_t InternFont(FPDF_FONT font, const std::string& name, bool want_program,
+                    FontInterner* fonts, pdfv1::FontTableChunk* new_fonts,
+                    std::vector<pdfv1::EmbeddedFont>* embedded_fonts) {
+  const int flags = FPDFFont_GetFlags(font);
   bool is_new = false;
-  uint32_t id = fonts->Intern(name, flags, &is_new);
-  if (!is_new) return;
+  const uint32_t id = fonts->Intern(name, flags, &is_new);
+  if (!is_new) return id;
   auto* ref = new_fonts->add_fonts();
   ref->set_font_id(id);
-  ref->set_base_name(name);
+  ref->set_base_name(ValidUtf8(name));
   if (flags >= 0) ref->set_descriptor_flags(static_cast<uint32_t>(flags));
-  char family_buf[256];
-  if (FPDFFont_GetFamilyName(font, family_buf, sizeof(family_buf)) > 1) {
-    ref->set_family(family_buf);
-  }
-  ref->set_embedded(FPDFFont_GetIsEmbedded(font) != 0);
-  if (ref->embedded()) {
+  std::string family = ByteField([font](void* buf, unsigned long len) {
+    return FPDFFont_GetFamilyName(font, static_cast<char*>(buf), len);
+  });
+  if (!family.empty()) ref->set_family(ValidUtf8(family));
+  ref->set_embedded(FPDFFont_GetIsEmbedded(font) == 1);
+  if (ref->embedded() && want_program) {
     size_t size = 0;
     if (FPDFFont_GetFontData(font, nullptr, 0, &size) && size > 0) {
-      std::vector<uint8_t> data(size);
-      if (FPDFFont_GetFontData(font, data.data(), size, &size)) {
+      std::string data(size, '\0');
+      if (FPDFFont_GetFontData(font, reinterpret_cast<uint8_t*>(data.data()),
+                               size, &size)) {
+        data.resize(size);
         pdfv1::EmbeddedFont program;
         program.set_font_id(id);
-        program.set_program(std::string(data.begin(), data.end()));
+        program.set_program(std::move(data));
         embedded_fonts->push_back(std::move(program));
       }
+    }
+  }
+  return id;
+}
+
+std::string BaseFontName(FPDF_FONT font) {
+  return ByteField([font](void* buf, unsigned long len) {
+    return FPDFFont_GetBaseFontName(font, static_cast<char*>(buf), len);
+  });
+}
+
+void FillFontFromObject(FPDF_PAGEOBJECT obj, bool want_program,
+                        FontInterner* fonts, pdfv1::FontTableChunk* new_fonts,
+                        std::vector<pdfv1::EmbeddedFont>* embedded_fonts) {
+  FPDF_FONT font = FPDFTextObj_GetFont(obj);
+  if (font == nullptr) return;
+  const std::string name = BaseFontName(font);
+  if (name.empty()) return;
+  InternFont(font, name, want_program, fonts, new_fonts, embedded_fonts);
+}
+
+// What one page's object walk fills.
+struct ObjectWalk {
+  FPDF_PAGE page;
+  bool want_images;
+  bool want_shapes;
+  bool want_fonts;
+  bool want_programs;
+  bool include_image_data;
+  FontInterner* fonts;
+  pdfv1::PageChunk* chunk;
+  pdfv1::FontTableChunk* new_fonts;
+  std::vector<pdfv1::EmbeddedFont>* embedded_fonts;
+  std::vector<pdfv1::ParseWarning>* warnings;
+  // Decoded image pixels placed in the chunk so far.
+  uint64_t* image_bytes;
+};
+
+// Visits the objects of the page (form null) or of one Form XObject,
+// descending into nested forms: many generators wrap a whole page in one,
+// and its images, paths and fonts belong to the page all the same. A
+// form's objects live in the form's space; to_page maps that space onto
+// the page. Malformed nesting is cut at a fixed depth.
+void WalkObjects(const ObjectWalk& walk, FPDF_PAGEOBJECT form,
+                 const FS_MATRIX& to_page, int depth) {
+  const int count = form == nullptr ? FPDFPage_CountObjects(walk.page)
+                                    : FPDFFormObj_CountObjects(form);
+  for (int i = 0; i < count; ++i) {
+    FPDF_PAGEOBJECT obj =
+        form == nullptr
+            ? FPDFPage_GetObject(walk.page, i)
+            : FPDFFormObj_GetObject(form, static_cast<unsigned long>(i));
+    if (obj == nullptr) continue;
+    switch (FPDFPageObj_GetType(obj)) {
+      case FPDF_PAGEOBJ_IMAGE:
+        if (walk.want_images) {
+          FillImage(walk.page, obj, to_page, walk.include_image_data,
+                    walk.image_bytes, walk.chunk, walk.warnings);
+        }
+        break;
+      case FPDF_PAGEOBJ_PATH:
+        if (walk.want_shapes) FillShape(obj, to_page, walk.chunk);
+        break;
+      case FPDF_PAGEOBJ_TEXT:
+        if (walk.want_fonts) {
+          FillFontFromObject(obj, walk.want_programs, walk.fonts,
+                             walk.new_fonts, walk.embedded_fonts);
+        }
+        break;
+      case FPDF_PAGEOBJ_FORM: {
+        // The form object's matrix maps the form's space into its parent's.
+        FS_MATRIX form_matrix;
+        if (depth < 64 && FPDFPageObj_GetMatrix(obj, &form_matrix)) {
+          WalkObjects(walk, obj, Concat(form_matrix, to_page), depth + 1);
+        }
+        break;
+      }
+      default:
+        break;
     }
   }
 }
@@ -819,9 +1015,42 @@ bool WantFamily(const pdfv1::ParseRequest& request, pdfv1::PdfFamily family) {
                    family) != request.families().end();
 }
 
+std::optional<uint32_t> InternCharFont(
+    FPDF_TEXTPAGE text_page, int index, FPDF_PAGEOBJECT text_object,
+    bool want_program, FontInterner* fonts, pdfv1::FontTableChunk* new_fonts,
+    std::vector<pdfv1::EmbeddedFont>* embedded_fonts) {
+  if (FPDF_FONT font =
+          text_object != nullptr ? FPDFTextObj_GetFont(text_object) : nullptr) {
+    const std::string name = BaseFontName(font);
+    if (name.empty()) return std::nullopt;
+    return InternFont(font, name, want_program, fonts, new_fonts,
+                      embedded_fonts);
+  }
+  // No text object behind the character: the text page still knows the
+  // font's name and flags, enough for a table entry under the same key.
+  int flags = 0;
+  const std::string name =
+      ByteField([text_page, index, &flags](void* buf, unsigned long len) {
+        return FPDFText_GetFontInfo(text_page, index, buf, len, &flags);
+      });
+  if (name.empty()) return std::nullopt;
+  flags &= kDescriptorFlagBits;
+  bool is_new = false;
+  const uint32_t id = fonts->Intern(name, flags, &is_new);
+  if (is_new) {
+    auto* ref = new_fonts->add_fonts();
+    ref->set_font_id(id);
+    ref->set_base_name(ValidUtf8(name));
+    ref->set_descriptor_flags(static_cast<uint32_t>(flags));
+  }
+  return id;
+}
+
 bool EmitDocLevelFamilies(
     FPDF_DOCUMENT doc, const pdfv1::ParseRequest& request, const DocFacts& facts,
-    const std::function<bool(const pdfv1::ParseResponse&)>& emit) {
+    const CropOrigins& origins,
+    const std::function<bool(const pdfv1::ParseResponse&)>& emit,
+    std::vector<pdfv1::ParseWarning>* warnings) {
   if (WantFamily(request, pdfv1::PDF_FAMILY_DOC_METADATA)) {
     pdfv1::ParseResponse msg;
     FillDocMeta(doc, facts, msg.mutable_doc_meta());
@@ -840,11 +1069,13 @@ bool EmitDocLevelFamilies(
          bookmark = FPDFBookmark_GetNextSibling(doc, bookmark)) {
       FillOutline(doc, bookmark, chunk->add_roots(), 0);
     }
+    ShiftToCropSpace(origins, chunk);
     if (!emit(msg)) return false;
   }
   if (facts.attachment_count > 0 &&
       WantFamily(request, pdfv1::PDF_FAMILY_ATTACHMENTS)) {
-    if (!EmitAttachments(doc, request.options().include_attachment_data(), emit)) {
+    if (!EmitAttachments(doc, request.options().include_attachment_data(), emit,
+                         warnings)) {
       return false;
     }
   }
@@ -867,35 +1098,29 @@ void ExtractPageTier12(FPDF_DOCUMENT doc, FPDF_PAGE page,
                        FPDF_FORMHANDLE form_handle,
                        const pdfv1::ParseRequest& request, FontInterner* fonts,
                        pdfv1::PageChunk* chunk, pdfv1::FontTableChunk* new_fonts,
-                       std::vector<pdfv1::EmbeddedFont>* embedded_fonts) {
+                       std::vector<pdfv1::EmbeddedFont>* embedded_fonts,
+                       std::vector<pdfv1::ParseWarning>* warnings) {
   const bool want_images = WantFamily(request, pdfv1::PDF_FAMILY_PLACED_IMAGES);
   const bool want_shapes = WantFamily(request, pdfv1::PDF_FAMILY_VECTOR_SHAPES);
-  const bool want_fonts = WantFamily(request, pdfv1::PDF_FAMILY_FONTS) ||
-                          WantFamily(request, pdfv1::PDF_FAMILY_EMBEDDED_FONTS);
+  const bool want_programs =
+      WantFamily(request, pdfv1::PDF_FAMILY_EMBEDDED_FONTS);
+  const bool want_fonts =
+      WantFamily(request, pdfv1::PDF_FAMILY_FONTS) || want_programs;
   if (want_images || want_shapes || want_fonts) {
-    int objects = FPDFPage_CountObjects(page);
-    for (int i = 0; i < objects; ++i) {
-      FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
-      if (obj == nullptr) continue;
-      switch (FPDFPageObj_GetType(obj)) {
-        case FPDF_PAGEOBJ_IMAGE:
-          if (want_images) {
-            FillImage(doc, page, obj, request.options().include_image_data(),
-                      chunk);
-          }
-          break;
-        case FPDF_PAGEOBJ_PATH:
-          if (want_shapes) FillShape(obj, chunk);
-          break;
-        case FPDF_PAGEOBJ_TEXT:
-          if (want_fonts) {
-            FillEmbeddedFontsFromObject(obj, fonts, new_fonts, embedded_fonts);
-          }
-          break;
-        default:
-          break;
-      }
-    }
+    uint64_t image_bytes = 0;
+    const ObjectWalk walk{page,
+                          want_images,
+                          want_shapes,
+                          want_fonts,
+                          want_programs,
+                          request.options().include_image_data(),
+                          fonts,
+                          chunk,
+                          new_fonts,
+                          embedded_fonts,
+                          warnings,
+                          &image_bytes};
+    WalkObjects(walk, nullptr, kIdentity, 0);
   }
   if (WantFamily(request, pdfv1::PDF_FAMILY_HYPERLINKS)) {
     FillHyperlinks(doc, page, chunk);
@@ -912,26 +1137,17 @@ void ExtractPageTier12(FPDF_DOCUMENT doc, FPDF_PAGE page,
   }
 }
 
-bool EmitStructTree(const std::vector<FPDF_PAGE>& pages,
-                    const std::function<bool(const pdfv1::ParseResponse&)>& emit,
-                    uint64_t* node_count) {
-  pdfv1::ParseResponse msg;
-  auto* chunk = msg.mutable_struct_tree();
-  for (size_t p = 0; p < pages.size(); ++p) {
-    if (pages[p] == nullptr) continue;
-    FPDF_STRUCTTREE tree = FPDF_StructTree_GetForPage(pages[p]);
-    if (tree == nullptr) continue;
-    int children = FPDF_StructTree_CountChildren(tree);
-    for (int c = 0; c < children; ++c) {
-      FPDF_STRUCTELEMENT elem = FPDF_StructTree_GetChildAtIndex(tree, c);
-      if (elem == nullptr) continue;
-      FillStructElement(elem, static_cast<uint32_t>(p), chunk->add_roots(), 0,
-                        node_count);
-    }
-    FPDF_StructTree_Close(tree);
+void AppendStructTree(FPDF_PAGE page, uint32_t page_index,
+                      pdfv1::StructTreeChunk* chunk, uint64_t* node_count) {
+  FPDF_STRUCTTREE tree = FPDF_StructTree_GetForPage(page);
+  if (tree == nullptr) return;
+  int children = FPDF_StructTree_CountChildren(tree);
+  for (int c = 0; c < children; ++c) {
+    FPDF_STRUCTELEMENT elem = FPDF_StructTree_GetChildAtIndex(tree, c);
+    if (elem == nullptr) continue;
+    FillStructElement(elem, page_index, chunk->add_roots(), 0, node_count);
   }
-  if (chunk->roots().empty()) return true;
-  return emit(msg);
+  FPDF_StructTree_Close(tree);
 }
 
 }  // namespace tier12

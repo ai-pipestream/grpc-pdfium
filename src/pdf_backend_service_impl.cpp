@@ -3,6 +3,7 @@
 #include <mutex>
 
 #include "pdfium_engine.h"
+#include "request_checks.h"
 #include "service_info.h"
 
 namespace grpc_pdfium {
@@ -34,6 +35,8 @@ grpc::Status PdfBackendServiceImpl::Probe(grpc::ServerContext* /*context*/,
 grpc::Status PdfBackendServiceImpl::Parse(
     grpc::ServerContext* /*context*/, const pdfv1::ParseRequest* request,
     grpc::ServerWriter<pdfv1::ParseResponse>* writer) {
+  grpc::Status checked = CheckParseRequest(*request);
+  if (!checked.ok()) return checked;
   std::lock_guard<std::mutex> lock(EngineMutex());
   PdfiumEngine::InitProcess();
   PdfiumEngine::Parse(*request, [writer](const pdfv1::ParseResponse& msg) {
@@ -45,20 +48,13 @@ grpc::Status PdfBackendServiceImpl::Parse(
 grpc::Status PdfBackendServiceImpl::Render(
     grpc::ServerContext* /*context*/, const pdfv1::RenderRequest* request,
     grpc::ServerWriter<pdfv1::RenderResponse>* writer) {
+  grpc::Status checked = CheckRenderRequest(*request);
+  if (!checked.ok()) return checked;
   std::lock_guard<std::mutex> lock(EngineMutex());
   PdfiumEngine::InitProcess();
-  std::string error;
-  bool ok = PdfiumEngine::Render(
+  return PdfiumEngine::Render(
       *request,
-      [writer](const pdfv1::RenderResponse& msg) { return writer->Write(msg); },
-      &error);
-  if (!ok && !error.empty()) {
-    grpc::StatusCode code = error.rfind("dpi ", 0) == 0
-                                ? grpc::StatusCode::INVALID_ARGUMENT
-                                : grpc::StatusCode::FAILED_PRECONDITION;
-    return grpc::Status(code, error);
-  }
-  return grpc::Status::OK;
+      [writer](const pdfv1::RenderResponse& msg) { return writer->Write(msg); });
 }
 
 grpc::Status PdfBackendServiceImpl::GetServiceInfo(
