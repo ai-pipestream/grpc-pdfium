@@ -36,24 +36,28 @@ DocFacts GatherDocFacts(FPDF_DOCUMENT doc);
 
 // Emits the document-level families (metadata, encryption, outline,
 // attachments, signatures, javascript) that the request selected. Returns
-// false when emit returned false.
+// false when emit returned false. Attachment bytes too large to send are
+// left out with a warning.
 bool EmitDocLevelFamilies(
     FPDF_DOCUMENT doc, const ai::protomolt::parse::pdf::v1::ParseRequest& request,
     const DocFacts& facts,
     const std::function<
-        bool(const ai::protomolt::parse::pdf::v1::ParseResponse&)>& emit);
+        bool(const ai::protomolt::parse::pdf::v1::ParseResponse&)>& emit,
+    std::vector<ai::protomolt::parse::pdf::v1::ParseWarning>* warnings);
 
 // Fills the tier 1-2 page-level families the request selected into the
 // chunk (images, hyperlinks, annotations, form fields, shapes, thumbnail)
 // and collects embedded font programs found on the page for separate
 // emission. form_handle may be null when form fields were not requested.
+// Image pixels past the decode limits are left out with a warning.
 void ExtractPageTier12(
     FPDF_DOCUMENT doc, FPDF_PAGE page, FPDF_FORMHANDLE form_handle,
     const ai::protomolt::parse::pdf::v1::ParseRequest& request,
     FontInterner* fonts,
     ai::protomolt::parse::pdf::v1::PageChunk* chunk,
     ai::protomolt::parse::pdf::v1::FontTableChunk* new_fonts,
-    std::vector<ai::protomolt::parse::pdf::v1::EmbeddedFont>* embedded_fonts);
+    std::vector<ai::protomolt::parse::pdf::v1::EmbeddedFont>* embedded_fonts,
+    std::vector<ai::protomolt::parse::pdf::v1::ParseWarning>* warnings);
 
 // Appends one page's structure tree roots to chunk, counting the nodes.
 // Only called for tagged documents.

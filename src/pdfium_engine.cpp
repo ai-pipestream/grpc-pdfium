@@ -503,7 +503,9 @@ bool PdfiumEngine::Parse(
       SelectPages(request.has_pages(), request.pages(), page_count);
 
   const tier12::DocFacts facts = tier12::GatherDocFacts(loaded.doc);
-  client_ok = tier12::EmitDocLevelFamilies(loaded.doc, request, facts, emit);
+  std::vector<pdfv1::ParseWarning> warnings;
+  client_ok =
+      tier12::EmitDocLevelFamilies(loaded.doc, request, facts, emit, &warnings);
 
   // Form-field access goes through a form-fill environment; a zeroed
   // struct with just the version is the read-only setup.
@@ -538,7 +540,7 @@ bool PdfiumEngine::Parse(
                        &embedded_fonts, &counts[pdfv1::PDF_FAMILY_TEXT_CELLS]);
     }
     tier12::ExtractPageTier12(loaded.doc, page, form_handle, request, &fonts,
-                              chunk, &new_fonts, &embedded_fonts);
+                              chunk, &new_fonts, &embedded_fonts, &warnings);
     counts[pdfv1::PDF_FAMILY_PLACED_IMAGES] += chunk->images_size();
     counts[pdfv1::PDF_FAMILY_HYPERLINKS] += chunk->hyperlinks_size();
     counts[pdfv1::PDF_FAMILY_ANNOTATIONS] += chunk->annotations_size();
@@ -588,6 +590,7 @@ bool PdfiumEngine::Parse(
     entry->set_family(family);
     entry->set_count(count);
   }
+  for (auto& warning : warnings) *trailer->add_warnings() = std::move(warning);
   return emit(trailer_msg);
 }
 

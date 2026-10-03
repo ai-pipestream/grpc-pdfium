@@ -2,8 +2,8 @@
 // fixture. rich.pdf carries the page-scoped and document-scoped families,
 // signed.pdf the signature field, the encrypted pair the encryption info
 // and the password load statuses, page-tree.pdf the page geometry a page
-// inherits through the page tree, and form-xobject.pdf content nested in
-// Form XObjects and invisible text.
+// inherits through the page tree, form-xobject.pdf content nested in Form
+// XObjects and invisible text, and huge-image.pdf the image decode limit.
 
 #include <algorithm>
 #include <cstdio>
@@ -138,8 +138,10 @@ int main(int argc, char** argv) {
   const std::string enc_locked = ReadFile(dir + "/encrypted-locked.pdf");
   const std::string page_tree = ReadFile(dir + "/page-tree.pdf");
   const std::string form_xobject = ReadFile(dir + "/form-xobject.pdf");
+  const std::string huge_image = ReadFile(dir + "/huge-image.pdf");
   Check(!rich.empty() && !signed_doc.empty() && !enc_open.empty() &&
-            !enc_locked.empty() && !page_tree.empty() && !form_xobject.empty(),
+            !enc_locked.empty() && !page_tree.empty() && !form_xobject.empty() &&
+            !huge_image.empty(),
         "fixtures read");
 
   grpc_pdfium::PdfBackendServiceImpl service;
@@ -532,6 +534,35 @@ int main(int argc, char** argv) {
     Check(std::find(font_names.begin(), font_names.end(), "Courier") !=
               font_names.end(),
           "a font used only inside a form reaches the table");
+  }
+
+  // huge-image.pdf: an image declaring 60000 x 60000 pixels (about 10.8 GB
+  // decoded) behind three bytes. With image data requested the placement is
+  // reported, the pixels are left out before anything is decoded, and the
+  // trailer says why.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_data(huge_image);
+    request.mutable_options()->set_include_image_data(true);
+    auto reader = stub->Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    pdfv1::PageChunk page;
+    pdfv1::ParseTrailer trailer;
+    while (reader->Read(&msg)) {
+      if (msg.has_page()) page = msg.page();
+      if (msg.has_trailer()) trailer = msg.trailer();
+    }
+    Check(reader->Finish().ok(), "huge-image Parse OK");
+    Check(page.images_size() == 1 && page.images(0).source_width_px() == 60000 &&
+              page.images(0).source_height_px() == 60000,
+          "the oversized image's placement is reported");
+    Check(page.images_size() == 1 && !page.images(0).has_image(),
+          "the oversized image's pixels are left out");
+    Check(trailer.warnings_size() == 1 && trailer.warnings(0).has_page_index() &&
+              trailer.warnings(0).page_index() == 0 &&
+              trailer.warnings(0).family() == pdfv1::PDF_FAMILY_PLACED_IMAGES,
+          "the trailer warns about the left-out image data");
   }
 
   // signed.pdf: the signature family delivers what is stored.

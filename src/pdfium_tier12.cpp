@@ -37,6 +37,27 @@ uint32_t FontInterner::Intern(const std::string& name, int flags,
 namespace tier12 {
 namespace {
 
+// Payload ceilings. A Parse message must fit the fleet's 520 MiB limit, and
+// decoding is where a hostile document turns a few bytes into gigabytes,
+// so sizes are checked before anything is decoded or copied.
+//
+// One placed image's pixels, decoded (sized at 4 bytes per pixel, the
+// widest layout BitmapToEncodedImage can produce).
+constexpr uint64_t kMaxImageDecodeBytes = 256ull << 20;
+// All decoded image pixels in one page's chunk.
+constexpr uint64_t kMaxPageImageBytes = 384ull << 20;
+// One attachment's bytes (each attachment is its own message).
+constexpr uint64_t kMaxAttachmentBytes = 256ull << 20;
+
+void Warn(std::vector<pdfv1::ParseWarning>* warnings,
+          std::optional<uint32_t> page_index, pdfv1::PdfFamily family,
+          std::string message) {
+  auto& warning = warnings->emplace_back();
+  if (page_index.has_value()) warning.set_page_index(*page_index);
+  warning.set_family(family);
+  warning.set_message(std::move(message));
+}
+
 // UTF-16LE little helper for the many two-call length-then-fill APIs.
 // Returns UTF-8; empty when the value is absent.
 std::string Utf16Field(
@@ -238,7 +259,8 @@ void FillOutline(FPDF_DOCUMENT doc, FPDF_BOOKMARK bookmark,
 }
 
 bool EmitAttachments(FPDF_DOCUMENT doc, bool include_data,
-                     const std::function<bool(const pdfv1::ParseResponse&)>& emit) {
+                     const std::function<bool(const pdfv1::ParseResponse&)>& emit,
+                     std::vector<pdfv1::ParseWarning>* warnings) {
   int count = FPDFDoc_GetAttachmentCount(doc);
   for (int i = 0; i < count; ++i) {
     FPDF_ATTACHMENT att = FPDFDoc_GetAttachment(doc, i);
@@ -269,12 +291,17 @@ bool EmitAttachments(FPDF_DOCUMENT doc, bool include_data,
     unsigned long size = 0;
     if (FPDFAttachment_GetFile(att, nullptr, 0, &size) && size > 0) {
       meta->set_size_bytes(size);
-      if (include_data) {
+      if (include_data && size > kMaxAttachmentBytes) {
+        Warn(warnings, std::nullopt, pdfv1::PDF_FAMILY_ATTACHMENTS,
+             "attachment " + meta->name() + " data left out: " +
+                 std::to_string(size) + " bytes is above the " +
+                 std::to_string(kMaxAttachmentBytes >> 20) + " MiB limit");
+      } else if (include_data) {
         std::string data(size, '\0');
         unsigned long got = 0;
         if (FPDFAttachment_GetFile(att, data.data(), size, &got)) {
-          data.resize(got);
-          meta->set_data(data);
+          data.resize(std::min(got, size));
+          meta->set_data(std::move(data));
         }
       }
     }
@@ -645,8 +672,45 @@ bool BitmapToEncodedImage(FPDF_BITMAP bitmap, pdfv1::EncodedImage* out) {
   return true;
 }
 
+// Decodes an image's pixels into image->image when they fit the decode
+// limits, counting them against the page's budget; otherwise leaves them
+// out with a warning. The size check reads the image's declared pixel size,
+// before PDFium allocates anything.
+void FillImageData(FPDF_PAGEOBJECT obj, pdfv1::PlacedImage* image,
+                   uint32_t page_index, uint64_t* page_image_bytes,
+                   std::vector<pdfv1::ParseWarning>* warnings) {
+  unsigned int width = 0;
+  unsigned int height = 0;
+  if (!FPDFImageObj_GetImagePixelSize(obj, &width, &height)) return;
+  // Two 32-bit factors cannot overflow 64 bits; the factor of 4 is applied
+  // only below the limit.
+  const uint64_t pixels = uint64_t{width} * height;
+  if (pixels > kMaxImageDecodeBytes / 4) {
+    Warn(warnings, page_index, pdfv1::PDF_FAMILY_PLACED_IMAGES,
+         "image data left out: " + std::to_string(width) + "x" +
+             std::to_string(height) + " pixels is above the " +
+             std::to_string(kMaxImageDecodeBytes >> 20) + " MiB decode limit");
+    return;
+  }
+  const uint64_t decoded = pixels * 4;
+  if (*page_image_bytes + decoded > kMaxPageImageBytes) {
+    Warn(warnings, page_index, pdfv1::PDF_FAMILY_PLACED_IMAGES,
+         "image data left out: the page's decoded images pass the " +
+             std::to_string(kMaxPageImageBytes >> 20) + " MiB limit");
+    return;
+  }
+  FPDF_BITMAP bitmap = FPDFImageObj_GetBitmap(obj);
+  if (bitmap == nullptr) return;
+  if (BitmapToEncodedImage(bitmap, image->mutable_image())) {
+    *page_image_bytes += image->image().data().size();
+  }
+  FPDFBitmap_Destroy(bitmap);
+}
+
 void FillImage(FPDF_PAGE page, FPDF_PAGEOBJECT obj, const FS_MATRIX& to_page,
-               bool include_data, pdfv1::PageChunk* chunk) {
+               bool include_data, uint64_t* page_image_bytes,
+               pdfv1::PageChunk* chunk,
+               std::vector<pdfv1::ParseWarning>* warnings) {
   auto* image = chunk->add_images();
   SetPageBounds(obj, to_page, image->mutable_bbox());
   FillQuadFromRotatedBounds(obj, to_page, image->mutable_quad(), image->bbox());
@@ -660,11 +724,7 @@ void FillImage(FPDF_PAGE page, FPDF_PAGEOBJECT obj, const FS_MATRIX& to_page,
     }
   }
   if (include_data) {
-    FPDF_BITMAP bitmap = FPDFImageObj_GetBitmap(obj);
-    if (bitmap != nullptr) {
-      BitmapToEncodedImage(bitmap, image->mutable_image());
-      FPDFBitmap_Destroy(bitmap);
-    }
+    FillImageData(obj, image, chunk->page_index(), page_image_bytes, warnings);
   }
 }
 
@@ -831,6 +891,9 @@ struct ObjectWalk {
   pdfv1::PageChunk* chunk;
   pdfv1::FontTableChunk* new_fonts;
   std::vector<pdfv1::EmbeddedFont>* embedded_fonts;
+  std::vector<pdfv1::ParseWarning>* warnings;
+  // Decoded image pixels placed in the chunk so far.
+  uint64_t* image_bytes;
 };
 
 // Visits the objects of the page (form null) or of one Form XObject,
@@ -852,7 +915,7 @@ void WalkObjects(const ObjectWalk& walk, FPDF_PAGEOBJECT form,
       case FPDF_PAGEOBJ_IMAGE:
         if (walk.want_images) {
           FillImage(walk.page, obj, to_page, walk.include_image_data,
-                    walk.chunk);
+                    walk.image_bytes, walk.chunk, walk.warnings);
         }
         break;
       case FPDF_PAGEOBJ_PATH:
@@ -971,7 +1034,8 @@ std::optional<uint32_t> InternCharFont(
 
 bool EmitDocLevelFamilies(
     FPDF_DOCUMENT doc, const pdfv1::ParseRequest& request, const DocFacts& facts,
-    const std::function<bool(const pdfv1::ParseResponse&)>& emit) {
+    const std::function<bool(const pdfv1::ParseResponse&)>& emit,
+    std::vector<pdfv1::ParseWarning>* warnings) {
   if (WantFamily(request, pdfv1::PDF_FAMILY_DOC_METADATA)) {
     pdfv1::ParseResponse msg;
     FillDocMeta(doc, facts, msg.mutable_doc_meta());
@@ -994,7 +1058,8 @@ bool EmitDocLevelFamilies(
   }
   if (facts.attachment_count > 0 &&
       WantFamily(request, pdfv1::PDF_FAMILY_ATTACHMENTS)) {
-    if (!EmitAttachments(doc, request.options().include_attachment_data(), emit)) {
+    if (!EmitAttachments(doc, request.options().include_attachment_data(), emit,
+                         warnings)) {
       return false;
     }
   }
@@ -1017,7 +1082,8 @@ void ExtractPageTier12(FPDF_DOCUMENT doc, FPDF_PAGE page,
                        FPDF_FORMHANDLE form_handle,
                        const pdfv1::ParseRequest& request, FontInterner* fonts,
                        pdfv1::PageChunk* chunk, pdfv1::FontTableChunk* new_fonts,
-                       std::vector<pdfv1::EmbeddedFont>* embedded_fonts) {
+                       std::vector<pdfv1::EmbeddedFont>* embedded_fonts,
+                       std::vector<pdfv1::ParseWarning>* warnings) {
   const bool want_images = WantFamily(request, pdfv1::PDF_FAMILY_PLACED_IMAGES);
   const bool want_shapes = WantFamily(request, pdfv1::PDF_FAMILY_VECTOR_SHAPES);
   const bool want_programs =
@@ -1025,6 +1091,7 @@ void ExtractPageTier12(FPDF_DOCUMENT doc, FPDF_PAGE page,
   const bool want_fonts =
       WantFamily(request, pdfv1::PDF_FAMILY_FONTS) || want_programs;
   if (want_images || want_shapes || want_fonts) {
+    uint64_t image_bytes = 0;
     const ObjectWalk walk{page,
                           want_images,
                           want_shapes,
@@ -1034,7 +1101,9 @@ void ExtractPageTier12(FPDF_DOCUMENT doc, FPDF_PAGE page,
                           fonts,
                           chunk,
                           new_fonts,
-                          embedded_fonts};
+                          embedded_fonts,
+                          warnings,
+                          &image_bytes};
     WalkObjects(walk, nullptr, kIdentity, 0);
   }
   if (WantFamily(request, pdfv1::PDF_FAMILY_HYPERLINKS)) {
