@@ -655,7 +655,7 @@ bool BitmapToEncodedImage(FPDF_BITMAP bitmap, pdfv1::EncodedImage* out) {
       out->set_width_px(static_cast<uint32_t>(width));
       out->set_height_px(static_cast<uint32_t>(height));
       out->set_stride_bytes(static_cast<uint32_t>(width * 3));
-      out->set_data(pixels);
+      out->set_data(std::move(pixels));
       return true;
     }
     default:
@@ -673,7 +673,7 @@ bool BitmapToEncodedImage(FPDF_BITMAP bitmap, pdfv1::EncodedImage* out) {
         reinterpret_cast<const char*>(buffer + static_cast<size_t>(y) * stride),
         static_cast<size_t>(width) * bytes_per_pixel);
   }
-  out->set_data(pixels);
+  out->set_data(std::move(pixels));
   return true;
 }
 
