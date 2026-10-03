@@ -41,6 +41,11 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   and the pool watchdog kills a worker whose call forwards nothing for
   `GRPC_PDFIUM_REQUEST_TIMEOUT_S` (DEADLINE_EXCEEDED). Both default to
   300 s, 0 turns one off. Respawns run outside the pool lock.
+  Each worker caps its own address space at
+  `GRPC_PDFIUM_WORKER_MAX_BYTES` (default 3 GiB, 0 off) and disables core
+  dumps (`src/main.cpp`): PDFium decodes whole streams with no size check
+  of its own, so that limit, not the engine's payload ceilings, is what
+  bounds a decompression bomb.
 - Default port is 50069 (`GRPC_PDFIUM_PORT` overrides). 50051/50052/50053
   belong to gRParse, grPOIc, and grpc-libreoffice; the PDF backends own
   50069 (pdfium), 50070 (qparse), 50071 (poppler) in the workspace table.

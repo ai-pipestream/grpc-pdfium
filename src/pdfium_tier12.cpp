@@ -38,8 +38,13 @@ namespace tier12 {
 namespace {
 
 // Payload ceilings. A Parse message must fit the fleet's 520 MiB limit, and
-// decoding is where a hostile document turns a few bytes into gigabytes,
-// so sizes are checked before anything is decoded or copied.
+// decoding is where a hostile document turns a few bytes into gigabytes.
+// An image's size is its declared pixel size, checked before PDFium decodes
+// anything. An attachment's size is not: FPDFAttachment_GetFile decodes the
+// whole stream (up to 1 GiB) just to report it, so the ceiling below only
+// keeps oversized bytes out of the message and spares a copy. What bounds
+// that decode is the worker's address-space limit
+// (GRPC_PDFIUM_WORKER_MAX_BYTES, main.cpp): a bomb costs one worker.
 //
 // One placed image's pixels, decoded (sized at 4 bytes per pixel, the
 // widest layout BitmapToEncodedImage can produce).

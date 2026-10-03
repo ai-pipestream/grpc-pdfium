@@ -12,12 +12,16 @@
 // the worker with SIGSTOP the way a pathological document wedges one, to
 // check that deadlines, cancellation, the bounded wait for a worker and
 // the watchdog all free the pool.
+// A last front runs its worker under a 1 GiB address-space limit and feeds
+// it a decompression bomb, which must cost that worker and nothing more.
 
 #include <dirent.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -145,6 +149,16 @@ long RssKib(pid_t pid) {
   std::string line;
   while (std::getline(status, line)) {
     if (line.rfind("VmRSS:", 0) == 0) return std::atol(line.c_str() + 6);
+  }
+  return -1;
+}
+
+// A process's peak resident set size in KiB, from /proc; -1 once it is gone.
+long PeakRssKib(pid_t pid) {
+  std::ifstream status("/proc/" + std::to_string(pid) + "/status");
+  std::string line;
+  while (std::getline(status, line)) {
+    if (line.rfind("VmHWM:", 0) == 0) return std::atol(line.c_str() + 6);
   }
   return -1;
 }
@@ -682,6 +696,64 @@ int main(int argc, char** argv) {
           "the pool serves again after the stalled client");
   }
   StopFront(&front);
+
+  // A decompression bomb: about two kilobytes whose one attachment inflates
+  // to 1 GiB, which PDFium decodes in full just to report its size (about
+  // 2 GiB resident at the peak). Under a 1 GiB worker address-space limit
+  // the decode fails inside the worker, which dies; the call ends
+  // UNAVAILABLE, no worker ever holds more than the limit, and the pool
+  // serves again.
+  {
+    std::string fixture_dir = argv[2];
+    fixture_dir.erase(fixture_dir.rfind('/') + 1);
+    std::ifstream in(fixture_dir + "attachment-bomb.pdf", std::ios::binary);
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    const std::string bomb = buf.str();
+    Check(!bomb.empty(), "attachment-bomb fixture read");
+
+    constexpr long kLimitKib = 1024 * 1024;
+    front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "1"},
+                                 {"GRPC_PDFIUM_WORKER_MAX_BYTES", "1073741824"}});
+    if (front.port > 0 && !bomb.empty()) {
+      auto stub = Dial(front.port);
+      // Sample the worker's peak resident size while the call runs: a
+      // worker that survives keeps its peak, one that dies is read until
+      // it goes.
+      std::atomic<bool> done{false};
+      long peak_kib = 0;
+      const std::vector<pid_t> workers = WorkerPids(front.pid);
+      Check(workers.size() == 1, "bomb front has one worker");
+      std::thread sampler([&] {
+        while (!done.load()) {
+          for (pid_t pid : workers) peak_kib = std::max(peak_kib, PeakRssKib(pid));
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        for (pid_t pid : workers) peak_kib = std::max(peak_kib, PeakRssKib(pid));
+      });
+      grpc::ClientContext ctx;
+      ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(60));
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(bomb);
+      request.add_families(pdfv1::PDF_FAMILY_ATTACHMENTS);
+      auto reader = stub->Parse(&ctx, request);
+      pdfv1::ParseResponse message;
+      bool saw_trailer = false;
+      while (reader->Read(&message)) {
+        if (message.has_trailer()) saw_trailer = true;
+      }
+      const grpc::Status status = reader->Finish();
+      done.store(true);
+      sampler.join();
+      Check(status.error_code() == grpc::StatusCode::UNAVAILABLE && !saw_trailer,
+            "a decompression bomb costs its worker and answers UNAVAILABLE");
+      Check(peak_kib > 0 && peak_kib < kLimitKib,
+            "the bomb's worker stays under its address-space limit");
+      Check(ProbeWithin(stub.get(), fixture, std::chrono::seconds(20)).ok(),
+            "the pool serves again after the bomb");
+    }
+    StopFront(&front);
+  }
 
   if (failures == 0) {
     std::printf("pool_roundtrip: all checks passed\n");
