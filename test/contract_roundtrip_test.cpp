@@ -276,9 +276,10 @@ int main(int argc, char** argv) {
           "non-finite or excessive DPI is INVALID_ARGUMENT");
   }
 
-  // Page ranges the contract forbids are INVALID_ARGUMENT before anything
-  // is loaded: end must exceed begin, and a bound above INT_MAX (which used
-  // to become a negative page index) never reaches the engine.
+  // Page ranges the contract forbids (end not above begin) are
+  // INVALID_ARGUMENT before anything is loaded. Every other range is
+  // served, bounds above INT_MAX included: they are clamped to the page
+  // count before they become page indexes.
   {
     struct RangeCase {
       uint32_t begin;
@@ -287,8 +288,6 @@ int main(int argc, char** argv) {
     };
     const RangeCase bad_ranges[] = {
         {0xFFFFFFFFu, 0xFFFFFFFFu, "Parse range at UINT32_MAX is INVALID_ARGUMENT"},
-        {0x80000000u, 0x80000001u, "Parse range above INT_MAX is INVALID_ARGUMENT"},
-        {0u, 0x80000000u, "Parse range ending above INT_MAX is INVALID_ARGUMENT"},
         {0u, 0u, "empty Parse range is INVALID_ARGUMENT"},
         {1u, 0u, "inverted Parse range is INVALID_ARGUMENT"},
     };
@@ -305,18 +304,46 @@ int main(int argc, char** argv) {
       Check(!streamed && reader->Finish().error_code() == grpc::INVALID_ARGUMENT,
             bad.what);
     }
+    // Bounds above INT_MAX: {0, UINT32_MAX} is "to the end" and selects
+    // the one page; a range wholly above INT_MAX selects none.
+    const RangeCase wide_ranges[] = {
+        {0u, 0xFFFFFFFFu, "Parse range to UINT32_MAX serves the page"},
+        {0u, 0x80000000u, "Parse range ending above INT_MAX serves the page"},
+        {0x80000000u, 0x80000001u, "Parse range above INT_MAX serves no page"},
+    };
+    for (const RangeCase& wide : wide_ranges) {
+      grpc::ClientContext ctx;
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(fixture);
+      request.mutable_pages()->set_begin(wide.begin);
+      request.mutable_pages()->set_end(wide.end);
+      auto reader = stub->Parse(&ctx, request);
+      pdfv1::ParseResponse message;
+      int pages = 0;
+      bool saw_trailer = false;
+      while (reader->Read(&message)) {
+        if (message.has_page()) ++pages;
+        if (message.has_trailer()) saw_trailer = true;
+      }
+      Check(reader->Finish().ok() && saw_trailer &&
+                pages == (wide.begin == 0 ? 1 : 0),
+            wide.what);
+    }
     {
       grpc::ClientContext ctx;
       pdfv1::RenderRequest request;
       request.mutable_document()->set_data(fixture);
       request.set_dpi(72.0);
-      request.mutable_pages()->set_begin(0x80000000u);
+      request.mutable_pages()->set_begin(0);
       request.mutable_pages()->set_end(0xFFFFFFFFu);
       auto reader = stub->Render(&ctx, request);
       pdfv1::RenderResponse message;
-      Check(!reader->Read(&message), "out-of-range Render produced nothing");
-      Check(reader->Finish().error_code() == grpc::INVALID_ARGUMENT,
-            "Render range above INT_MAX is INVALID_ARGUMENT");
+      int rasters = 0;
+      while (reader->Read(&message)) {
+        if (message.has_raster()) ++rasters;
+      }
+      Check(reader->Finish().ok() && rasters == 1,
+            "Render range to UINT32_MAX renders every page");
     }
     // A valid range past the last page is clamped: the header and trailer
     // arrive, no page chunk does.

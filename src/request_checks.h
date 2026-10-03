@@ -1,6 +1,5 @@
 #pragma once
 
-#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -20,10 +19,11 @@ namespace grpc_pdfium {
 // pixel arithmetic in range.
 inline constexpr double kMaxRenderDpi = 2400.0;
 
-// A set PageRange must have end greater than begin (the contract's rule),
-// and no document has more pages than an int can count (PDFium indexes
-// pages with int), so a bound above INT_MAX is rejected rather than ever
-// becoming a negative page index.
+// A set PageRange must have end greater than begin (the contract's only
+// rule). Any other range is served: SelectPages (pdfium_engine.cpp) clamps
+// both bounds to the page count in unsigned arithmetic before either
+// becomes an int page index, so {0, UINT32_MAX} means "to the end" and a
+// range past the last page selects nothing.
 inline grpc::Status CheckPageRange(
     const ai::protomolt::parse::pdf::v1::PageRange& range) {
   if (range.end() <= range.begin()) {
@@ -31,11 +31,6 @@ inline grpc::Status CheckPageRange(
                         "pages.end must be greater than pages.begin (got " +
                             std::to_string(range.begin()) + ", " +
                             std::to_string(range.end()) + ")");
-  }
-  if (range.end() > static_cast<uint32_t>(INT_MAX)) {
-    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                        "pages.end " + std::to_string(range.end()) +
-                            " is beyond any page index");
   }
   return grpc::Status::OK;
 }

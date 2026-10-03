@@ -281,9 +281,8 @@ int main(int argc, char** argv) {
             "pool Parse returned the fixture text");
     }
 
-    // A page range above INT_MAX used to reach a worker as a negative page
-    // index and crash it, twice per request with the retry. The front now
-    // answers INVALID_ARGUMENT itself, and the pool keeps serving.
+    // A range the contract forbids (end not above begin) is answered
+    // INVALID_ARGUMENT by the front itself, before it costs a worker.
     {
       grpc::ClientContext ctx;
       pdfv1::ParseRequest request;
@@ -294,8 +293,12 @@ int main(int argc, char** argv) {
       pdfv1::ParseResponse message;
       Check(!reader->Read(&message), "front streams nothing for a bad range");
       Check(reader->Finish().error_code() == grpc::INVALID_ARGUMENT,
-            "front rejects a Parse range above INT_MAX");
+            "front rejects a Parse range with end not above begin");
     }
+    // A range above INT_MAX used to reach a worker as a negative page
+    // index and crash it, twice per request with the retry. The worker now
+    // clamps it to the page count, so it renders nothing, and to the end
+    // of the document when begin is in range.
     {
       grpc::ClientContext ctx;
       pdfv1::RenderRequest request;
@@ -305,9 +308,24 @@ int main(int argc, char** argv) {
       request.mutable_pages()->set_end(0x80000001u);
       auto reader = stub->Render(&ctx, request);
       pdfv1::RenderResponse message;
-      Check(!reader->Read(&message), "front renders nothing for a bad range");
-      Check(reader->Finish().error_code() == grpc::INVALID_ARGUMENT,
-            "front rejects a Render range above INT_MAX");
+      bool rastered = false;
+      while (reader->Read(&message)) rastered = rastered || message.has_raster();
+      Check(reader->Finish().ok() && !rastered,
+            "a Render range above INT_MAX is clamped to no page");
+    }
+    {
+      grpc::ClientContext ctx;
+      pdfv1::RenderRequest request;
+      request.mutable_document()->set_data(fixture);
+      request.set_dpi(72.0);
+      request.mutable_pages()->set_begin(0);
+      request.mutable_pages()->set_end(0xFFFFFFFFu);
+      auto reader = stub->Render(&ctx, request);
+      pdfv1::RenderResponse message;
+      int rasters = 0;
+      while (reader->Read(&message)) rasters += message.has_raster() ? 1 : 0;
+      Check(reader->Finish().ok() && rasters == 1,
+            "a Render range to UINT32_MAX renders the document");
     }
     {
       grpc::ClientContext ctx;
@@ -322,7 +340,7 @@ int main(int argc, char** argv) {
         if (message.has_page()) saw_page = true;
       }
       Check(reader->Finish().ok() && saw_page,
-            "pool still parses after the rejected ranges");
+            "pool still parses after the out-of-range requests");
     }
 
     // The content-addressed handshake. The cache runs with capacity 2
