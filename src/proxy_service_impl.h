@@ -19,7 +19,8 @@ namespace grpc_pdfium {
 // waits for a free worker no longer than its client does, nor than
 // queue_limit when that is set (then RESOURCE_EXHAUSTED); the pool's
 // watchdog ends a worker call that stops making progress
-// (DEADLINE_EXCEEDED).
+// (DEADLINE_EXCEEDED), or cancels the client's call when the front is stuck
+// writing to a client that stopped reading (the client sees CANCELLED).
 //
 // The front also owns the content-addressed document handshake
 // (PdfDocument.sha256): it verifies hashes, answers cache hits and misses,

@@ -29,7 +29,9 @@ which is respawned. A request waits for a free worker no longer than its
 client does, nor than `GRPC_PDFIUM_QUEUE_TIMEOUT_S` (default 300), and then
 fails `RESOURCE_EXHAUSTED`. A watchdog kills a worker whose call forwards
 nothing for `GRPC_PDFIUM_REQUEST_TIMEOUT_S` (default 300); that call ends
-`DEADLINE_EXCEEDED` and the slot comes back respawned. 0 turns either limit
+`DEADLINE_EXCEEDED`, or `CANCELLED` when the front was stuck writing to a
+client that stopped reading (the watchdog cancels that call), and the slot
+comes back respawned. 0 turns either limit
 off; each takes whole seconds up to 604800 (a week), and any other value
 stops the service at startup.
 
