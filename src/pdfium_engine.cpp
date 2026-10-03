@@ -180,6 +180,23 @@ void FillPageInfo(FPDF_DOCUMENT doc, FPDF_PAGE page, int index,
   }
 }
 
+// The pages [begin, end) a request selects, clamped to the document. The
+// arithmetic stays unsigned: the services reject ranges the contract
+// forbids, and a range past the last page comes out empty, never negative.
+struct PageSpan {
+  int begin = 0;
+  int end = 0;
+};
+
+PageSpan SelectPages(bool has_range, const pdfv1::PageRange& range,
+                     int page_count) {
+  const uint32_t count = static_cast<uint32_t>(std::max(page_count, 0));
+  if (!has_range) return {0, static_cast<int>(count)};
+  const uint32_t begin = std::min(range.begin(), count);
+  const uint32_t end = std::max(begin, std::min(range.end(), count));
+  return {static_cast<int>(begin), static_cast<int>(end)};
+}
+
 // Whitespace as the word splitter: ASCII space controls plus the common
 // Unicode space code points the text page emits.
 bool IsWordBreak(unsigned short unit) {
@@ -347,12 +364,8 @@ bool PdfiumEngine::Parse(
     return client_ok;
   }
 
-  int begin = 0;
-  int end = page_count;
-  if (request.has_pages()) {
-    begin = std::min<int>(static_cast<int>(request.pages().begin()), page_count);
-    end = std::min<int>(static_cast<int>(request.pages().end()), page_count);
-  }
+  const PageSpan span =
+      SelectPages(request.has_pages(), request.pages(), page_count);
 
   const tier12::DocFacts facts = tier12::GatherDocFacts(loaded.doc);
   client_ok = tier12::EmitDocLevelFamilies(loaded.doc, request, facts, emit);
@@ -372,7 +385,7 @@ bool PdfiumEngine::Parse(
   FontInterner fonts;
   std::map<pdfv1::PdfFamily, uint64_t> counts;
   counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] = static_cast<uint64_t>(page_count);
-  for (int i = begin; client_ok && i < end; ++i) {
+  for (int i = span.begin; client_ok && i < span.end; ++i) {
     FPDF_PAGE page = pages[static_cast<size_t>(i)];
     if (page == nullptr) continue;
     pdfv1::ParseResponse page_msg;
@@ -449,17 +462,12 @@ bool PdfiumEngine::Render(
     return false;
   }
 
-  int page_count = FPDF_GetPageCount(loaded.doc);
-  int begin = 0;
-  int end = page_count;
-  if (request.has_pages()) {
-    begin = std::min<int>(static_cast<int>(request.pages().begin()), page_count);
-    end = std::min<int>(static_cast<int>(request.pages().end()), page_count);
-  }
+  const PageSpan span = SelectPages(request.has_pages(), request.pages(),
+                                    FPDF_GetPageCount(loaded.doc));
 
   const bool gray = request.pixel_format() == pdfv1::PIXEL_FORMAT_GRAY8;
   const double scale = request.dpi() / 72.0;
-  for (int i = begin; i < end; ++i) {
+  for (int i = span.begin; i < span.end; ++i) {
     FPDF_PAGE page = FPDF_LoadPage(loaded.doc, i);
     if (page == nullptr) continue;
     int width = std::max(1, static_cast<int>(

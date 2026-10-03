@@ -4,6 +4,7 @@
 #include <string>
 
 #include "pdfium_engine.h"
+#include "request_checks.h"
 #include "service_info.h"
 #include "sha256.h"
 
@@ -139,6 +140,10 @@ grpc::Status ProxyServiceImpl::Probe(grpc::ServerContext* /*context*/,
 grpc::Status ProxyServiceImpl::Parse(grpc::ServerContext* /*context*/,
                                      const pdfv1::ParseRequest* request,
                                      grpc::ServerWriter<pdfv1::ParseResponse>* writer) {
+  // A malformed request fails here, before it resolves bytes or leases a
+  // worker.
+  grpc::Status checked = CheckParseRequest(*request);
+  if (!checked.ok()) return checked;
   pdfv1::ParseRequest resolved = *request;
   std::string detail;
   ResolveResult result =
@@ -168,6 +173,8 @@ grpc::Status ProxyServiceImpl::Parse(grpc::ServerContext* /*context*/,
 grpc::Status ProxyServiceImpl::Render(grpc::ServerContext* /*context*/,
                                       const pdfv1::RenderRequest* request,
                                       grpc::ServerWriter<pdfv1::RenderResponse>* writer) {
+  grpc::Status checked = CheckRenderRequest(*request);
+  if (!checked.ok()) return checked;
   pdfv1::RenderRequest resolved = *request;
   std::string detail;
   ResolveResult result =

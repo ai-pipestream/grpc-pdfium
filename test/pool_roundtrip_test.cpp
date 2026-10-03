@@ -143,6 +143,50 @@ int main(int argc, char** argv) {
             "pool Parse returned the fixture text");
     }
 
+    // A page range above INT_MAX used to reach a worker as a negative page
+    // index and crash it, twice per request with the retry. The front now
+    // answers INVALID_ARGUMENT itself, and the pool keeps serving.
+    {
+      grpc::ClientContext ctx;
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(fixture);
+      request.mutable_pages()->set_begin(0xFFFFFFFFu);
+      request.mutable_pages()->set_end(0xFFFFFFFFu);
+      auto reader = stub->Parse(&ctx, request);
+      pdfv1::ParseResponse message;
+      Check(!reader->Read(&message), "front streams nothing for a bad range");
+      Check(reader->Finish().error_code() == grpc::INVALID_ARGUMENT,
+            "front rejects a Parse range above INT_MAX");
+    }
+    {
+      grpc::ClientContext ctx;
+      pdfv1::RenderRequest request;
+      request.mutable_document()->set_data(fixture);
+      request.set_dpi(72.0);
+      request.mutable_pages()->set_begin(0x80000000u);
+      request.mutable_pages()->set_end(0x80000001u);
+      auto reader = stub->Render(&ctx, request);
+      pdfv1::RenderResponse message;
+      Check(!reader->Read(&message), "front renders nothing for a bad range");
+      Check(reader->Finish().error_code() == grpc::INVALID_ARGUMENT,
+            "front rejects a Render range above INT_MAX");
+    }
+    {
+      grpc::ClientContext ctx;
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(fixture);
+      request.mutable_pages()->set_begin(0);
+      request.mutable_pages()->set_end(1);
+      auto reader = stub->Parse(&ctx, request);
+      pdfv1::ParseResponse message;
+      bool saw_page = false;
+      while (reader->Read(&message)) {
+        if (message.has_page()) saw_page = true;
+      }
+      Check(reader->Finish().ok() && saw_page,
+            "pool still parses after the rejected ranges");
+    }
+
     // The content-addressed handshake. The cache runs with capacity 2
     // (GRPC_PDFIUM_CACHE_MAX_DOCUMENTS above) so eviction is testable.
     Check(grpc_pdfium::Sha256Hex("") ==

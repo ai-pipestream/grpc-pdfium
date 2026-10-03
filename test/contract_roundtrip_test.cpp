@@ -3,8 +3,11 @@
 // Render against the hello.pdf fixture (one Letter page, Helvetica 24pt
 // "Hello PDF" at (100, 700)).
 
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -227,6 +230,87 @@ int main(int argc, char** argv) {
     Check(!reader->Read(&message), "zero-DPI render produced nothing");
     Check(reader->Finish().error_code() == grpc::INVALID_ARGUMENT,
           "zero DPI is INVALID_ARGUMENT");
+  }
+
+  // DPI that is not finite, or above the cap, is INVALID_ARGUMENT before
+  // any pixel arithmetic runs.
+  for (double dpi : {std::nan(""), std::numeric_limits<double>::infinity(),
+                     1.0e9}) {
+    grpc::ClientContext ctx;
+    pdfv1::RenderRequest request;
+    request.mutable_document()->set_data(fixture);
+    request.set_dpi(dpi);
+    auto reader = stub->Render(&ctx, request);
+    pdfv1::RenderResponse message;
+    Check(!reader->Read(&message), "out-of-range DPI rendered nothing");
+    Check(reader->Finish().error_code() == grpc::INVALID_ARGUMENT,
+          "non-finite or excessive DPI is INVALID_ARGUMENT");
+  }
+
+  // Page ranges the contract forbids are INVALID_ARGUMENT before anything
+  // is loaded: end must exceed begin, and a bound above INT_MAX (which used
+  // to become a negative page index) never reaches the engine.
+  {
+    struct RangeCase {
+      uint32_t begin;
+      uint32_t end;
+      const char* what;
+    };
+    const RangeCase bad_ranges[] = {
+        {0xFFFFFFFFu, 0xFFFFFFFFu, "Parse range at UINT32_MAX is INVALID_ARGUMENT"},
+        {0x80000000u, 0x80000001u, "Parse range above INT_MAX is INVALID_ARGUMENT"},
+        {0u, 0x80000000u, "Parse range ending above INT_MAX is INVALID_ARGUMENT"},
+        {0u, 0u, "empty Parse range is INVALID_ARGUMENT"},
+        {1u, 0u, "inverted Parse range is INVALID_ARGUMENT"},
+    };
+    for (const RangeCase& bad : bad_ranges) {
+      grpc::ClientContext ctx;
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(fixture);
+      request.mutable_pages()->set_begin(bad.begin);
+      request.mutable_pages()->set_end(bad.end);
+      auto reader = stub->Parse(&ctx, request);
+      pdfv1::ParseResponse message;
+      bool streamed = false;
+      while (reader->Read(&message)) streamed = true;
+      Check(!streamed && reader->Finish().error_code() == grpc::INVALID_ARGUMENT,
+            bad.what);
+    }
+    {
+      grpc::ClientContext ctx;
+      pdfv1::RenderRequest request;
+      request.mutable_document()->set_data(fixture);
+      request.set_dpi(72.0);
+      request.mutable_pages()->set_begin(0x80000000u);
+      request.mutable_pages()->set_end(0xFFFFFFFFu);
+      auto reader = stub->Render(&ctx, request);
+      pdfv1::RenderResponse message;
+      Check(!reader->Read(&message), "out-of-range Render produced nothing");
+      Check(reader->Finish().error_code() == grpc::INVALID_ARGUMENT,
+            "Render range above INT_MAX is INVALID_ARGUMENT");
+    }
+    // A valid range past the last page is clamped: the header and trailer
+    // arrive, no page chunk does.
+    {
+      grpc::ClientContext ctx;
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(fixture);
+      request.mutable_pages()->set_begin(5);
+      request.mutable_pages()->set_end(9);
+      auto reader = stub->Parse(&ctx, request);
+      pdfv1::ParseResponse message;
+      bool saw_header = false;
+      bool saw_page = false;
+      bool saw_trailer = false;
+      while (reader->Read(&message)) {
+        if (message.has_header()) saw_header = message.header().pages_size() == 1;
+        if (message.has_page()) saw_page = true;
+        if (message.has_trailer()) saw_trailer = true;
+      }
+      Check(reader->Finish().ok(), "range past the last page parses OK");
+      Check(saw_header && saw_trailer && !saw_page,
+            "range past the last page streams the inventory and no page");
+    }
   }
 
   // Render bytes that never loaded: FAILED_PRECONDITION.
