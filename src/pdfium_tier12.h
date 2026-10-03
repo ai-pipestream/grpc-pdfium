@@ -3,11 +3,13 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "ai/protomolt/parse/pdf/v1/pdf_backend_service.pb.h"
+#include "fpdf_text.h"
 #include "fpdfview.h"
 
 namespace grpc_pdfium {
@@ -63,11 +65,23 @@ void AppendStructTree(FPDF_PAGE page, uint32_t page_index,
 bool WantFamily(const ai::protomolt::parse::pdf::v1::ParseRequest& request,
                 ai::protomolt::parse::pdf::v1::PdfFamily family);
 
+// Interns the font the character at index on a text page is drawn with
+// (text_object is that character's FPDFText_GetTextObject, which may be
+// null), adding a new font's table entry and program as InternFont does.
+// Returns the font id, or nullopt when the engine names no font.
+std::optional<uint32_t> InternCharFont(
+    FPDF_TEXTPAGE text_page, int index, FPDF_PAGEOBJECT text_object,
+    bool want_program, FontInterner* fonts,
+    ai::protomolt::parse::pdf::v1::FontTableChunk* new_fonts,
+    std::vector<ai::protomolt::parse::pdf::v1::EmbeddedFont>* embedded_fonts);
+
 }  // namespace tier12
 
-// Assigns stable ids to (base name, flags) font identities within one Parse
-// stream; shared between the text-page cells and the page-object font walk
-// so both reference one table.
+// Assigns stable ids to (base name, descriptor flags) font identities within
+// one Parse stream; shared between the text-page cells and the page-object
+// font walk so both reference one table. Both read the key from the font
+// handle (FPDFFont_GetBaseFontName, FPDFFont_GetFlags), so a font gets one
+// id whichever path meets it first.
 class FontInterner {
  public:
   uint32_t Intern(const std::string& name, int flags, bool* is_new);

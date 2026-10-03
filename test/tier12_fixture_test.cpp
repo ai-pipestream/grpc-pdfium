@@ -1,8 +1,9 @@
 // The M2 gate: every family the backend claims in Probe is exercised by a
 // fixture. rich.pdf carries the page-scoped and document-scoped families,
 // signed.pdf the signature field, the encrypted pair the encryption info
-// and the password load statuses, and page-tree.pdf the page geometry a
-// page inherits through the page tree.
+// and the password load statuses, page-tree.pdf the page geometry a page
+// inherits through the page tree, and form-xobject.pdf content nested in
+// Form XObjects and invisible text.
 
 #include <cstdio>
 #include <fstream>
@@ -135,8 +136,9 @@ int main(int argc, char** argv) {
   const std::string enc_open = ReadFile(dir + "/encrypted-open.pdf");
   const std::string enc_locked = ReadFile(dir + "/encrypted-locked.pdf");
   const std::string page_tree = ReadFile(dir + "/page-tree.pdf");
+  const std::string form_xobject = ReadFile(dir + "/form-xobject.pdf");
   Check(!rich.empty() && !signed_doc.empty() && !enc_open.empty() &&
-            !enc_locked.empty() && !page_tree.empty(),
+            !enc_locked.empty() && !page_tree.empty() && !form_xobject.empty(),
         "fixtures read");
 
   grpc_pdfium::PdfBackendServiceImpl service;
@@ -237,6 +239,38 @@ int main(int argc, char** argv) {
       }
     }
     Check(ubuntu_ref, "font table marks UbuntuMono embedded");
+    // One font, one id: the text cells and the page-object walk read the
+    // same font handle, so the cell that draws in UbuntuMono points at the
+    // entry that carries the program, and no font is listed twice.
+    std::map<std::string, int> names;
+    for (const auto& f : s.fonts) ++names[f.base_name()];
+    bool listed_once = !names.empty();
+    for (const auto& [name, n] : names) listed_once = listed_once && n == 1;
+    Check(listed_once, "every font is listed once");
+    const pdfv1::TextCell* embedded_cell = nullptr;
+    for (const auto& cell : s.page.text_cells()) {
+      if (cell.text() == "Embedded") embedded_cell = &cell;
+    }
+    Check(embedded_cell != nullptr && embedded_cell->has_font_id(),
+          "the UbuntuMono cell names a font");
+    if (embedded_cell != nullptr && embedded_cell->has_font_id()) {
+      const pdfv1::FontRef* ref = nullptr;
+      for (const auto& f : s.fonts) {
+        if (f.font_id() == embedded_cell->font_id()) ref = &f;
+      }
+      Check(ref != nullptr && ref->base_name() == "UbuntuMono" &&
+                ref->embedded() && ref->descriptor_flags() == 33,
+            "the cell's font_id resolves to the embedded UbuntuMono entry");
+      Check(s.embedded_fonts.size() == 1 &&
+                s.embedded_fonts[0].font_id() == embedded_cell->font_id(),
+            "the embedded program belongs to the cell's font");
+    }
+    bool all_fill = s.page.text_cells_size() > 0;
+    for (const auto& cell : s.page.text_cells()) {
+      all_fill = all_fill &&
+                 cell.rendering_mode() == pdfv1::TEXT_RENDERING_MODE_FILL;
+    }
+    Check(all_fill, "fill-mode text reports TEXT_RENDERING_MODE_FILL");
 
     Check(s.has_page, "page chunk arrived");
     Check(s.page.images_size() == 1, "placed image arrived");
@@ -419,6 +453,31 @@ int main(int argc, char** argv) {
     const Ranged mismatched = parse_page(hello, &sha, 0);
     Check(mismatched.inventory == 1 && mismatched.loads == 2,
           "cached inventory is keyed to the bytes it was built from");
+  }
+
+  // form-xobject.pdf: text drawn with 3 Tr is the invisible OCR underlay,
+  // and the cells say so; text inside a Form XObject is a cell too.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_data(form_xobject);
+    request.add_families(pdfv1::PDF_FAMILY_TEXT_CELLS);
+    auto reader = stub->Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    std::map<std::string, pdfv1::TextRenderingMode> modes;
+    while (reader->Read(&msg)) {
+      if (!msg.has_page()) continue;
+      for (const auto& cell : msg.page().text_cells()) {
+        modes[cell.text()] = cell.rendering_mode();
+      }
+    }
+    Check(reader->Finish().ok(), "form-xobject text Parse OK");
+    Check(modes["Visible"] == pdfv1::TEXT_RENDERING_MODE_FILL,
+          "filled text reports FILL");
+    Check(modes["Invisible"] == pdfv1::TEXT_RENDERING_MODE_INVISIBLE,
+          "3 Tr text reports INVISIBLE");
+    Check(modes["Inside"] == pdfv1::TEXT_RENDERING_MODE_FILL,
+          "text inside a Form XObject reports its own mode");
   }
 
   // signed.pdf: the signature family delivers what is stored.

@@ -722,41 +722,63 @@ void FillShape(FPDF_PAGEOBJECT obj, pdfv1::PageChunk* chunk) {
   }
 }
 
-void FillEmbeddedFontsFromObject(
-    FPDF_PAGEOBJECT obj, FontInterner* fonts,
-    pdfv1::FontTableChunk* new_fonts,
-    std::vector<pdfv1::EmbeddedFont>* embedded_fonts) {
-  FPDF_FONT font = FPDFTextObj_GetFont(obj);
-  if (font == nullptr) return;
-  char name_buf[256];
-  size_t name_len = FPDFFont_GetBaseFontName(font, name_buf, sizeof(name_buf));
-  if (name_len == 0) return;
-  std::string name(name_buf);
-  int flags = FPDFFont_GetFlags(font);
+// FPDFText_GetFontInfo reports PDFium's internal font flags; the descriptor
+// bits ISO 32000-1 table 123 defines (what FPDFFont_GetFlags reports) are
+// the low 19.
+constexpr int kDescriptorFlagBits = 0x7FFFF;
+
+// Interns a font. The first time a font is seen, its complete table entry
+// (base name, family, descriptor flags, whether a program is embedded) goes
+// into new_fonts and, when want_program is set, its embedded program into
+// embedded_fonts, so whichever path meets a font first leaves nothing for
+// the other to add.
+uint32_t InternFont(FPDF_FONT font, const std::string& name, bool want_program,
+                    FontInterner* fonts, pdfv1::FontTableChunk* new_fonts,
+                    std::vector<pdfv1::EmbeddedFont>* embedded_fonts) {
+  const int flags = FPDFFont_GetFlags(font);
   bool is_new = false;
-  uint32_t id = fonts->Intern(name, flags, &is_new);
-  if (!is_new) return;
+  const uint32_t id = fonts->Intern(name, flags, &is_new);
+  if (!is_new) return id;
   auto* ref = new_fonts->add_fonts();
   ref->set_font_id(id);
   ref->set_base_name(name);
   if (flags >= 0) ref->set_descriptor_flags(static_cast<uint32_t>(flags));
-  char family_buf[256];
-  if (FPDFFont_GetFamilyName(font, family_buf, sizeof(family_buf)) > 1) {
-    ref->set_family(family_buf);
-  }
-  ref->set_embedded(FPDFFont_GetIsEmbedded(font) != 0);
-  if (ref->embedded()) {
+  std::string family = ByteField([font](void* buf, unsigned long len) {
+    return FPDFFont_GetFamilyName(font, static_cast<char*>(buf), len);
+  });
+  if (!family.empty()) ref->set_family(family);
+  ref->set_embedded(FPDFFont_GetIsEmbedded(font) == 1);
+  if (ref->embedded() && want_program) {
     size_t size = 0;
     if (FPDFFont_GetFontData(font, nullptr, 0, &size) && size > 0) {
-      std::vector<uint8_t> data(size);
-      if (FPDFFont_GetFontData(font, data.data(), size, &size)) {
+      std::string data(size, '\0');
+      if (FPDFFont_GetFontData(font, reinterpret_cast<uint8_t*>(data.data()),
+                               size, &size)) {
+        data.resize(size);
         pdfv1::EmbeddedFont program;
         program.set_font_id(id);
-        program.set_program(std::string(data.begin(), data.end()));
+        program.set_program(std::move(data));
         embedded_fonts->push_back(std::move(program));
       }
     }
   }
+  return id;
+}
+
+std::string BaseFontName(FPDF_FONT font) {
+  return ByteField([font](void* buf, unsigned long len) {
+    return FPDFFont_GetBaseFontName(font, static_cast<char*>(buf), len);
+  });
+}
+
+void FillFontFromObject(FPDF_PAGEOBJECT obj, bool want_program,
+                        FontInterner* fonts, pdfv1::FontTableChunk* new_fonts,
+                        std::vector<pdfv1::EmbeddedFont>* embedded_fonts) {
+  FPDF_FONT font = FPDFTextObj_GetFont(obj);
+  if (font == nullptr) return;
+  const std::string name = BaseFontName(font);
+  if (name.empty()) return;
+  InternFont(font, name, want_program, fonts, new_fonts, embedded_fonts);
 }
 
 void FillThumbnail(FPDF_PAGE page, pdfv1::PageChunk* chunk) {
@@ -819,6 +841,37 @@ bool WantFamily(const pdfv1::ParseRequest& request, pdfv1::PdfFamily family) {
                    family) != request.families().end();
 }
 
+std::optional<uint32_t> InternCharFont(
+    FPDF_TEXTPAGE text_page, int index, FPDF_PAGEOBJECT text_object,
+    bool want_program, FontInterner* fonts, pdfv1::FontTableChunk* new_fonts,
+    std::vector<pdfv1::EmbeddedFont>* embedded_fonts) {
+  if (FPDF_FONT font =
+          text_object != nullptr ? FPDFTextObj_GetFont(text_object) : nullptr) {
+    const std::string name = BaseFontName(font);
+    if (name.empty()) return std::nullopt;
+    return InternFont(font, name, want_program, fonts, new_fonts,
+                      embedded_fonts);
+  }
+  // No text object behind the character: the text page still knows the
+  // font's name and flags, enough for a table entry under the same key.
+  int flags = 0;
+  const std::string name =
+      ByteField([text_page, index, &flags](void* buf, unsigned long len) {
+        return FPDFText_GetFontInfo(text_page, index, buf, len, &flags);
+      });
+  if (name.empty()) return std::nullopt;
+  flags &= kDescriptorFlagBits;
+  bool is_new = false;
+  const uint32_t id = fonts->Intern(name, flags, &is_new);
+  if (is_new) {
+    auto* ref = new_fonts->add_fonts();
+    ref->set_font_id(id);
+    ref->set_base_name(name);
+    ref->set_descriptor_flags(static_cast<uint32_t>(flags));
+  }
+  return id;
+}
+
 bool EmitDocLevelFamilies(
     FPDF_DOCUMENT doc, const pdfv1::ParseRequest& request, const DocFacts& facts,
     const std::function<bool(const pdfv1::ParseResponse&)>& emit) {
@@ -870,8 +923,10 @@ void ExtractPageTier12(FPDF_DOCUMENT doc, FPDF_PAGE page,
                        std::vector<pdfv1::EmbeddedFont>* embedded_fonts) {
   const bool want_images = WantFamily(request, pdfv1::PDF_FAMILY_PLACED_IMAGES);
   const bool want_shapes = WantFamily(request, pdfv1::PDF_FAMILY_VECTOR_SHAPES);
-  const bool want_fonts = WantFamily(request, pdfv1::PDF_FAMILY_FONTS) ||
-                          WantFamily(request, pdfv1::PDF_FAMILY_EMBEDDED_FONTS);
+  const bool want_programs =
+      WantFamily(request, pdfv1::PDF_FAMILY_EMBEDDED_FONTS);
+  const bool want_fonts =
+      WantFamily(request, pdfv1::PDF_FAMILY_FONTS) || want_programs;
   if (want_images || want_shapes || want_fonts) {
     int objects = FPDFPage_CountObjects(page);
     for (int i = 0; i < objects; ++i) {
@@ -889,7 +944,8 @@ void ExtractPageTier12(FPDF_DOCUMENT doc, FPDF_PAGE page,
           break;
         case FPDF_PAGEOBJ_TEXT:
           if (want_fonts) {
-            FillEmbeddedFontsFromObject(obj, fonts, new_fonts, embedded_fonts);
+            FillFontFromObject(obj, want_programs, fonts, new_fonts,
+                               embedded_fonts);
           }
           break;
         default:

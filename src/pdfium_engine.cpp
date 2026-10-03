@@ -7,6 +7,7 @@
 #include <limits>
 #include <list>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -348,7 +349,9 @@ bool IsWordBreak(unsigned short unit) {
 // take the union of the text rects each word occupies, and read font
 // identity from the word's first character.
 void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
-                      FontInterner* fonts, pdfv1::FontTableChunk* new_fonts,
+                      bool want_programs, FontInterner* fonts,
+                      pdfv1::FontTableChunk* new_fonts,
+                      std::vector<pdfv1::EmbeddedFont>* embedded_fonts,
                       uint64_t* cell_count) {
   FPDF_TEXTPAGE text_page = FPDFText_LoadPage(page);
   if (text_page == nullptr) return;
@@ -425,25 +428,27 @@ void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
     quad->set_y3(y1);
 
     cell->set_font_size(FPDFText_GetFontSize(text_page, word_start));
-    char name_buf[256];
-    int flags = 0;
-    unsigned long name_len = FPDFText_GetFontInfo(
-        text_page, word_start, name_buf, sizeof(name_buf), &flags);
-    if (name_len > 0) {
-      std::string name(name_buf,
-                       std::min<unsigned long>(name_len, sizeof(name_buf)));
-      // The reported length includes the trailing NUL.
-      while (!name.empty() && name.back() == '\0') name.pop_back();
-      bool is_new = false;
-      uint32_t id = fonts->Intern(name, flags, &is_new);
-      cell->set_font_id(id);
-      if (is_new) {
-        auto* ref = new_fonts->add_fonts();
-        ref->set_font_id(id);
-        ref->set_base_name(name);
-        ref->set_descriptor_flags(static_cast<uint32_t>(flags));
-        // Embedded-program presence lands with the tier 1 font work; the
-        // tier 0 table reports identity and descriptor flags only.
+    // Font and render mode come from the text object that draws the word's
+    // first character: the same font handle the page-object walk sees, so
+    // the cell's font_id is the entry that carries the embedded program.
+    FPDF_PAGEOBJECT text_object = FPDFText_GetTextObject(text_page, word_start);
+    if (std::optional<uint32_t> font_id = tier12::InternCharFont(
+            text_page, word_start, text_object, want_programs, fonts,
+            new_fonts, embedded_fonts)) {
+      cell->set_font_id(*font_id);
+    }
+    if (text_object != nullptr) {
+      // Tr 0..7 map onto the contract's modes one up; Tr 3 is the invisible
+      // OCR underlay.
+      static_assert(pdfv1::TEXT_RENDERING_MODE_FILL ==
+                    FPDF_TEXTRENDERMODE_FILL + 1);
+      static_assert(pdfv1::TEXT_RENDERING_MODE_CLIP ==
+                    FPDF_TEXTRENDERMODE_CLIP + 1);
+      const FPDF_TEXT_RENDERMODE mode =
+          FPDFTextObj_GetTextRenderMode(text_object);
+      if (mode >= FPDF_TEXTRENDERMODE_FILL && mode <= FPDF_TEXTRENDERMODE_CLIP) {
+        cell->set_rendering_mode(
+            static_cast<pdfv1::TextRenderingMode>(mode + 1));
       }
     }
     ++*cell_count;
@@ -512,6 +517,8 @@ bool PdfiumEngine::Parse(
 
   const bool want_text =
       tier12::WantFamily(request, pdfv1::PDF_FAMILY_TEXT_CELLS);
+  const bool want_programs =
+      tier12::WantFamily(request, pdfv1::PDF_FAMILY_EMBEDDED_FONTS);
   FontInterner fonts;
   std::map<pdfv1::PdfFamily, uint64_t> counts;
   counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] = static_cast<uint64_t>(page_count);
@@ -527,8 +534,8 @@ bool PdfiumEngine::Parse(
     pdfv1::FontTableChunk new_fonts;
     std::vector<pdfv1::EmbeddedFont> embedded_fonts;
     if (want_text) {
-      ExtractTextCells(page, chunk, &fonts, &new_fonts,
-                       &counts[pdfv1::PDF_FAMILY_TEXT_CELLS]);
+      ExtractTextCells(page, chunk, want_programs, &fonts, &new_fonts,
+                       &embedded_fonts, &counts[pdfv1::PDF_FAMILY_TEXT_CELLS]);
     }
     tier12::ExtractPageTier12(loaded.doc, page, form_handle, request, &fonts,
                               chunk, &new_fonts, &embedded_fonts);
