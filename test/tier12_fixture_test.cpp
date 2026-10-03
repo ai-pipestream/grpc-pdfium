@@ -1,7 +1,8 @@
 // The M2 gate: every family the backend claims in Probe is exercised by a
 // fixture. rich.pdf carries the page-scoped and document-scoped families,
-// signed.pdf the signature field, and the encrypted pair the encryption
-// info and the password load statuses.
+// signed.pdf the signature field, the encrypted pair the encryption info
+// and the password load statuses, and page-tree.pdf the page geometry a
+// page inherits through the page tree.
 
 #include <cstdio>
 #include <fstream>
@@ -130,8 +131,9 @@ int main(int argc, char** argv) {
   const std::string signed_doc = ReadFile(dir + "/signed.pdf");
   const std::string enc_open = ReadFile(dir + "/encrypted-open.pdf");
   const std::string enc_locked = ReadFile(dir + "/encrypted-locked.pdf");
+  const std::string page_tree = ReadFile(dir + "/page-tree.pdf");
   Check(!rich.empty() && !signed_doc.empty() && !enc_open.empty() &&
-            !enc_locked.empty(),
+            !enc_locked.empty() && !page_tree.empty(),
         "fixtures read");
 
   grpc_pdfium::PdfBackendServiceImpl service;
@@ -305,6 +307,64 @@ int main(int argc, char** argv) {
               s.counts[pdfv1::PDF_FAMILY_EMBEDDED_FONTS] == 1 &&
               s.counts[pdfv1::PDF_FAMILY_STRUCT_TREE] >= 1,
           "trailer counts the tier 1-2 families");
+  }
+
+  // page-tree.pdf: boxes and rotation inherited through /Pages nodes reach
+  // the inventory. crop_box is the box the renderer uses (inherited, clipped
+  // to the MediaBox); cells stay in untranslated user space, which is the
+  // frame consumers place against crop_box.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_data(page_tree);
+    request.add_families(pdfv1::PDF_FAMILY_TEXT_CELLS);
+    auto reader = stub->Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    pdfv1::ParseHeader header;
+    std::map<uint32_t, pdfv1::TextCell> first_cells;
+    while (reader->Read(&msg)) {
+      if (msg.has_header()) header = msg.header();
+      if (msg.has_page() && msg.page().text_cells_size() > 0) {
+        first_cells[msg.page().page_index()] = msg.page().text_cells(0);
+      }
+    }
+    Check(reader->Finish().ok(), "page-tree Parse OK");
+    auto box_is = [](const pdfv1::BoundingBox& box, double x0, double y0,
+                     double x1, double y1) {
+      return box.x0() == x0 && box.y0() == y0 && box.x1() == x1 &&
+             box.y1() == y1;
+    };
+    Check(header.pages_size() == 4, "page-tree inventory lists four pages");
+    if (header.pages_size() == 4) {
+      const auto& p0 = header.pages(0);
+      Check(p0.has_media_box() && box_is(p0.media_box(), 0, 0, 600, 800),
+            "MediaBox inherited from the root /Pages node");
+      Check(p0.has_crop_box() && box_is(p0.crop_box(), 0, 0, 600, 800),
+            "no CropBox anywhere: crop_box equals the inherited MediaBox");
+      const auto& p1 = header.pages(1);
+      Check(box_is(p1.media_box(), 0, 0, 600, 800) &&
+                box_is(p1.crop_box(), 50, 100, 550, 700),
+            "own CropBox over an inherited MediaBox");
+      Check(p1.width_pts() == 500 && p1.height_pts() == 600,
+            "page size is the CropBox");
+      const auto& p2 = header.pages(2);
+      Check(p2.rotation_degrees() == 90, "/Rotate inherited from a /Pages node");
+      Check(box_is(p2.media_box(), 0, 0, 600, 800) &&
+                box_is(p2.crop_box(), 10, 20, 590, 780),
+            "CropBox inherited from an intermediate /Pages node");
+      Check(p2.width_pts() == 760 && p2.height_pts() == 580,
+            "rotated page size swaps the CropBox sides");
+      const auto& p3 = header.pages(3);
+      Check(p3.rotation_degrees() == 0, "own /Rotate overrides the inherited one");
+      Check(box_is(p3.media_box(), 0, 0, 300, 400) &&
+                box_is(p3.crop_box(), 10, 20, 300, 400),
+            "inherited CropBox clipped to the page's own MediaBox");
+    }
+    Check(first_cells.size() == 4, "every page-tree page has a text cell");
+    Check(first_cells[1].text() == "cropped" &&
+              first_cells[1].bbox().x0() > 99.0 &&
+              first_cells[1].bbox().x0() < 101.0,
+          "cells stay in user space, not shifted by the CropBox origin");
   }
 
   // signed.pdf: the signature family delivers what is stored.

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <string>
 #include <utility>
@@ -156,32 +157,51 @@ void FillCapabilities(const LoadedDocument& loaded,
   }
 }
 
-void FillPageInfo(FPDF_DOCUMENT doc, FPDF_PAGE page, int index,
-                  pdfv1::PageInfo* info) {
-  (void)doc;
+void SetBox(pdfv1::BoundingBox* box, float left, float bottom, float right,
+            float top) {
+  box->set_x0(std::min(left, right));
+  box->set_y0(std::min(bottom, top));
+  box->set_x1(std::max(left, right));
+  box->set_y1(std::max(bottom, top));
+}
+
+// /MediaBox, /CropBox and /Rotate are inheritable through the page tree
+// (ISO 32000-1 7.7.3.4), but FPDFPage_GetMediaBox and FPDFPage_GetCropBox
+// read only the page's own dictionary and miss a box set on a /Pages node.
+// FPDF_GetPageBoundingBox is the CropBox the renderer uses: inherited,
+// clipped to the MediaBox (14.11.2) and falling back to it, which is what
+// PageInfo.crop_box names and what the raster covers. Geometry stays in
+// untranslated user space; consumers place it against this box.
+void FillPageInfo(FPDF_PAGE page, int index, pdfv1::PageInfo* info) {
   info->set_page_index(static_cast<uint32_t>(index));
   info->set_width_pts(FPDF_GetPageWidthF(page));
   info->set_height_pts(FPDF_GetPageHeightF(page));
   info->set_rotation_degrees(FPDFPage_GetRotation(page) * 90);
+  FS_RECTF crop;
+  if (!FPDF_GetPageBoundingBox(page, &crop)) return;
+  SetBox(info->mutable_crop_box(), crop.left, crop.bottom, crop.right,
+         crop.top);
   float left = 0;
   float bottom = 0;
   float right = 0;
   float top = 0;
   if (FPDFPage_GetMediaBox(page, &left, &bottom, &right, &top)) {
-    auto* box = info->mutable_media_box();
-    box->set_x0(left);
-    box->set_y0(bottom);
-    box->set_x1(right);
-    box->set_y1(top);
-  }
-  if (FPDFPage_GetCropBox(page, &left, &bottom, &right, &top)) {
-    auto* box = info->mutable_crop_box();
-    box->set_x0(left);
-    box->set_y0(bottom);
-    box->set_x1(right);
-    box->set_y1(top);
-  } else if (info->has_media_box()) {
-    *info->mutable_crop_box() = info->media_box();
+    SetBox(info->mutable_media_box(), left, bottom, right, top);
+  } else if (crop.right > crop.left && crop.top > crop.bottom) {
+    // An inherited MediaBox has no getter. Widening the CropBox to all of
+    // user space makes the renderer's box the MediaBox itself; the CropBox
+    // is then set back to the box read above, so the page's effective box
+    // (and anything computed from it later) is unchanged. The edit lives
+    // only in this request's in-memory document.
+    constexpr float kAll = std::numeric_limits<float>::max();
+    FPDFPage_SetCropBox(page, -kAll, -kAll, kAll, kAll);
+    FS_RECTF media;
+    const bool has_media = FPDF_GetPageBoundingBox(page, &media);
+    FPDFPage_SetCropBox(page, crop.left, crop.bottom, crop.right, crop.top);
+    if (has_media) {
+      SetBox(info->mutable_media_box(), media.left, media.bottom, media.right,
+             media.top);
+    }
   }
 }
 
@@ -357,8 +377,7 @@ bool PdfiumEngine::Parse(
   for (int i = 0; i < page_count; ++i) {
     pages[static_cast<size_t>(i)] = FPDF_LoadPage(loaded.doc, i);
     if (pages[static_cast<size_t>(i)] != nullptr) {
-      FillPageInfo(loaded.doc, pages[static_cast<size_t>(i)], i,
-                   header->add_pages());
+      FillPageInfo(pages[static_cast<size_t>(i)], i, header->add_pages());
     }
   }
   bool client_ok = emit(header_msg);
