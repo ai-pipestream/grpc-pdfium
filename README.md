@@ -27,8 +27,9 @@ No request can hold a worker for good. A worker call inherits its client's
 deadline and cancellation, and a call the client abandons kills its worker,
 which is respawned. A request waits for a free worker no longer than its
 client does, nor than `GRPC_PDFIUM_QUEUE_TIMEOUT_S` (default 300), and then
-fails `RESOURCE_EXHAUSTED`. A watchdog kills a worker whose call forwards
-nothing for `GRPC_PDFIUM_REQUEST_TIMEOUT_S` (default 300); that call ends
+fails `RESOURCE_EXHAUSTED`. A watchdog kills a worker whose call makes no
+progress (forwards no message and loads no page) for
+`GRPC_PDFIUM_REQUEST_TIMEOUT_S` (default 300); that call ends
 `DEADLINE_EXCEEDED`, or `CANCELLED` when the front was stuck writing to a
 client that stopped reading (the watchdog cancels that call), and the slot
 comes back respawned. 0 turns either limit

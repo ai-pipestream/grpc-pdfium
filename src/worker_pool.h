@@ -22,12 +22,18 @@ namespace grpc_pdfium {
 // time, and a crash on a hostile document kills one worker, not the
 // service.
 //
-// A watchdog bounds every lease. A call that forwards nothing for the stall
+// A watchdog bounds every lease. A call that makes no progress for the stall
 // limit, or that is still leased a second after its client went away, has
 // its worker killed, which ends a front call stuck on it; if the lease is
 // still held a second later, the front is stuck writing to a client that
 // stopped reading, and the client's call is cancelled. Either way the slot
 // comes back respawned, so no document can hold a worker for good.
+//
+// Progress is a message forwarded (Touch) or a heartbeat from the worker
+// itself: each worker gets one end of a socket pair (--heartbeat-fd) and
+// writes a byte to it for every page it loads, so a first Parse that
+// spends minutes filling a large document's page inventory before its
+// header is alive, while a worker wedged inside one page is not.
 class WorkerPool {
  public:
   struct Lease {
@@ -82,6 +88,8 @@ class WorkerPool {
     bool stalled = false;
     // The watchdog cancelled this lease's call.
     bool call_cancelled = false;
+    // The front's end of the worker's heartbeat socket pair; -1 when none.
+    int heartbeat_fd = -1;
   };
 
   // A started worker process and its channel.
@@ -89,6 +97,7 @@ class WorkerPool {
     pid_t pid = -1;
     std::shared_ptr<grpc::Channel> channel;
     std::unique_ptr<Stub> stub;
+    int heartbeat_fd = -1;
   };
 
   // Starts one worker on socket_path and waits for its socket to come up.

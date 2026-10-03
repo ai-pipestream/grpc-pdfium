@@ -85,12 +85,13 @@ bool LimitWorkerMemory(uint64_t max_bytes) {
   return true;
 }
 
-int RunWorker(const std::string& socket_path) {
+int RunWorker(const std::string& socket_path, int heartbeat_fd) {
   uint64_t max_bytes = 0;
   if (!WorkerMaxBytesFromEnv(&max_bytes) || !LimitWorkerMemory(max_bytes)) {
     return 1;
   }
   grpc_pdfium::PdfiumEngine::InitProcess();
+  grpc_pdfium::PdfiumEngine::SetHeartbeatFd(heartbeat_fd);
   grpc_pdfium::PdfBackendServiceImpl service;
   grpc::ServerBuilder builder;
   builder.SetMaxReceiveMessageSize(kMaxMessageBytes);
@@ -162,10 +163,10 @@ int RunFront() {
     cache_max_bytes = std::strtoull(env, nullptr, 10);
   }
 
-  // How long a worker call may go without forwarding a message before the
-  // watchdog kills its worker, and how long a request may wait for a free
-  // worker. 0 turns either limit off (a request then waits as long as its
-  // client does).
+  // How long a worker call may go without progress (a forwarded message or
+  // a page-load heartbeat) before the watchdog kills its worker, and how
+  // long a request may wait for a free worker. 0 turns either limit off (a
+  // request then waits as long as its client does).
   const std::optional<std::chrono::seconds> request_timeout =
       SecondsFromEnv("GRPC_PDFIUM_REQUEST_TIMEOUT_S", 300);
   const std::optional<std::chrono::seconds> queue_timeout =
@@ -216,8 +217,13 @@ int RunFront() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // --worker <socket> [--heartbeat-fd <fd>], as WorkerPool::Spawn runs it.
   if (argc == 3 && std::string(argv[1]) == "--worker") {
-    return RunWorker(argv[2]);
+    return RunWorker(argv[2], -1);
+  }
+  if (argc == 5 && std::string(argv[1]) == "--worker" &&
+      std::string(argv[3]) == "--heartbeat-fd") {
+    return RunWorker(argv[2], std::atoi(argv[4]));
   }
   return RunFront();
 }

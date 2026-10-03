@@ -43,9 +43,13 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   `ClientContext::FromServerContext`, so the client's deadline and
   cancellation reach them; an abandoned call kills its worker; the wait for
   a free worker ends at `GRPC_PDFIUM_QUEUE_TIMEOUT_S` (RESOURCE_EXHAUSTED);
-  and the pool watchdog kills a worker whose call forwards nothing for
+  and the pool watchdog kills a worker whose call makes no progress for
   `GRPC_PDFIUM_REQUEST_TIMEOUT_S` (DEADLINE_EXCEEDED; CANCELLED when the
-  front was stuck writing to a client that stopped reading). Both default to
+  front was stuck writing to a client that stopped reading). Progress is a
+  forwarded message or a worker heartbeat: each worker writes a byte per
+  page load to a socket pair the front gave it (`--heartbeat-fd`), so a
+  first `Parse` filling a large document's inventory is not cut before its
+  header. Both default to
   300 s, 0 turns one off, and a value that is not whole seconds up to a
   week stops the start. Respawns run outside the pool lock.
   Each worker caps its own address space at

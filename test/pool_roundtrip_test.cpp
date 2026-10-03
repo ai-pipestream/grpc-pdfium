@@ -11,7 +11,8 @@
 // The last part runs fronts with one worker and short limits, and freezes
 // the worker with SIGSTOP the way a pathological document wedges one, to
 // check that deadlines, cancellation, the bounded wait for a worker and
-// the watchdog all free the pool.
+// the watchdog all free the pool, and that a worker still loading pages
+// is not mistaken for a stalled one.
 // A last front runs its worker under a 1 GiB address-space limit and feeds
 // it a decompression bomb, which must cost that worker and nothing more.
 
@@ -201,6 +202,46 @@ grpc::Status ProbeWithin(pdfv1::PdfBackendService::Stub* stub,
   request.mutable_document()->set_data(data);
   pdfv1::ProbeResponse response;
   return stub->Probe(&ctx, request, &response);
+}
+
+// A document whose page inventory takes seconds to fill: page_count pages
+// sharing one content stream of ops line segments, each page a few
+// milliseconds for PDFium to load.
+std::string SlowInventoryPdf(int page_count, int ops) {
+  std::string content;
+  for (int i = 0; i < ops; ++i) content += "0 0 m 1 1 l S\n";
+  std::vector<std::string> objects;
+  objects.push_back("<< /Type /Catalog /Pages 2 0 R >>");
+  std::string kids;
+  for (int i = 0; i < page_count; ++i) {
+    kids += std::to_string(4 + i) + " 0 R ";
+  }
+  objects.push_back("<< /Type /Pages /Kids [" + kids + "] /Count " +
+                    std::to_string(page_count) +
+                    " /MediaBox [0 0 612 792] >>");
+  objects.push_back("<< /Length " + std::to_string(content.size()) +
+                    " >>\nstream\n" + content + "\nendstream");
+  for (int i = 0; i < page_count; ++i) {
+    objects.push_back("<< /Type /Page /Parent 2 0 R /Contents 3 0 R >>");
+  }
+  std::string out = "%PDF-1.7\n";
+  std::vector<size_t> offsets;
+  for (size_t i = 0; i < objects.size(); ++i) {
+    offsets.push_back(out.size());
+    out += std::to_string(i + 1) + " 0 obj\n" + objects[i] + "\nendobj\n";
+  }
+  const size_t xref = out.size();
+  out += "xref\n0 " + std::to_string(objects.size() + 1) +
+         "\n0000000000 65535 f \n";
+  for (size_t offset : offsets) {
+    char line[32];
+    std::snprintf(line, sizeof(line), "%010zu 00000 n \n", offset);
+    out += line;
+  }
+  out += "trailer\n<< /Size " + std::to_string(objects.size() + 1) +
+         " /Root 1 0 R >>\nstartxref\n" + std::to_string(xref) +
+         "\n%%EOF\n";
+  return out;
 }
 
 }  // namespace
@@ -753,6 +794,44 @@ int main(int argc, char** argv) {
           "the pool serves again after the stalled client");
   }
   StopFront(&front);
+
+  // A first Parse of a large document fills the whole page inventory before
+  // its header, forwarding nothing for as long as that takes. The worker's
+  // per-page heartbeat is progress, so under a one-second stall limit the
+  // call still completes; the limit is for a worker wedged in one page.
+  {
+    const std::string slow = SlowInventoryPdf(400, 20000);
+    front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "1"},
+                                 {"GRPC_PDFIUM_REQUEST_TIMEOUT_S", "1"}});
+    if (front.port > 0) {
+      auto stub = Dial(front.port);
+      grpc::ClientContext ctx;
+      ctx.set_deadline(std::chrono::system_clock::now() +
+                       std::chrono::seconds(120));
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(slow);
+      request.mutable_pages()->set_begin(0);
+      request.mutable_pages()->set_end(1);
+      const auto started = std::chrono::steady_clock::now();
+      auto reader = stub->Parse(&ctx, request);
+      pdfv1::ParseResponse message;
+      int inventory = 0;
+      int pages = 0;
+      while (reader->Read(&message)) {
+        if (message.has_header()) inventory = message.header().pages_size();
+        if (message.has_page()) ++pages;
+      }
+      const grpc::Status status = reader->Finish();
+      const double took = std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - started)
+                              .count();
+      std::printf("pool_roundtrip: slow inventory Parse took %.1f s\n", took);
+      Check(status.ok() && inventory == 400 && pages == 1,
+            "a first Parse slower than the stall limit to its header, but "
+            "loading pages, is not cut");
+    }
+    StopFront(&front);
+  }
 
   // A decompression bomb: about two kilobytes whose one attachment inflates
   // to 1 GiB, which PDFium decodes in full just to report its size (about

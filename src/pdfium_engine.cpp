@@ -1,5 +1,7 @@
 #include "pdfium_engine.h"
 
+#include <sys/socket.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -230,6 +232,19 @@ PageSpan SelectPages(bool has_range, const pdfv1::PageRange& range,
 // Pages loaded in this process; see PdfiumEngine::PageLoads.
 uint64_t page_loads = 0;
 
+// The worker's heartbeat socket; see PdfiumEngine::SetHeartbeatFd.
+int heartbeat_fd = -1;
+
+// One byte to the front's watchdog per page load. MSG_DONTWAIT: a full
+// buffer already holds unread progress. MSG_NOSIGNAL: a front gone away
+// costs no SIGPIPE.
+void Heartbeat() {
+  if (heartbeat_fd < 0) return;
+  const char beat = 0;
+  ssize_t ignored = send(heartbeat_fd, &beat, 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+  (void)ignored;
+}
+
 // A loaded page, closed when it goes out of scope. FPDF_LoadPage parses the
 // page's content stream, the expensive part of touching a page, so every
 // load in the engine goes through here and is counted.
@@ -237,6 +252,7 @@ class ScopedPage {
  public:
   ScopedPage(FPDF_DOCUMENT doc, int index) : page_(FPDF_LoadPage(doc, index)) {
     ++page_loads;
+    Heartbeat();
   }
   ~ScopedPage() {
     if (page_ != nullptr) FPDF_ClosePage(page_);
@@ -476,6 +492,8 @@ const char* PdfiumEngine::BackendName() { return kBackendName; }
 const char* PdfiumEngine::EngineVersion() { return kEngineVersion; }
 
 uint64_t PdfiumEngine::PageLoads() { return page_loads; }
+
+void PdfiumEngine::SetHeartbeatFd(int fd) { heartbeat_fd = fd; }
 
 void PdfiumEngine::Probe(const pdfv1::PdfDocument& document,
                          pdfv1::BackendCapabilities* caps) {

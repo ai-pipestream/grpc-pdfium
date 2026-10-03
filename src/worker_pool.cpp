@@ -1,7 +1,9 @@
 #include "worker_pool.h"
 
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -13,6 +15,24 @@
 namespace grpc_pdfium {
 
 namespace pdfv1 = ai::protomolt::parse::pdf::v1;
+
+namespace {
+
+// Reads whatever heartbeats a worker has written since the last look.
+// Returns true when there was at least one. Bounded, so a worker writing as
+// fast as it can cannot hold the caller (which holds the pool lock).
+bool DrainHeartbeats(int fd) {
+  if (fd < 0) return false;
+  bool any = false;
+  char buf[4096];
+  for (int i = 0; i < 64; ++i) {
+    if (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) <= 0) break;
+    any = true;
+  }
+  return any;
+}
+
+}  // namespace
 
 WorkerPool::WorkerPool(std::string self_exe, std::string socket_dir, int size,
                        std::chrono::seconds stall_limit)
@@ -29,6 +49,7 @@ WorkerPool::WorkerPool(std::string self_exe, std::string socket_dir, int size,
     w.pid = process.pid;
     w.channel = std::move(process.channel);
     w.stub = std::move(process.stub);
+    w.heartbeat_fd = process.heartbeat_fd;
   }
   watchdog_ = std::thread([this] { Watch(); });
 }
@@ -46,12 +67,25 @@ WorkerPool::~WorkerPool() {
       waitpid(w.pid, nullptr, 0);
       unlink(w.socket_path.c_str());
     }
+    if (w.heartbeat_fd >= 0) close(w.heartbeat_fd);
   }
 }
 
 WorkerPool::Process WorkerPool::Spawn(const std::string& socket_path) const {
   unlink(socket_path.c_str());
   Process process;
+  // The heartbeat channel: the worker writes a byte per page it loads to
+  // its end, the watchdog reads the front's end. Both ends are close-on-exec
+  // so no other worker inherits them; the child clears the flag on its own
+  // end only. Without the pair the worker still runs, minus the heartbeat.
+  int heartbeat[2] = {-1, -1};
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
+                 heartbeat) != 0) {
+    heartbeat[0] = heartbeat[1] = -1;
+  }
+  // Formatted before the fork: the child may only make async-signal-safe
+  // calls.
+  const std::string heartbeat_arg = std::to_string(heartbeat[1]);
   pid_t parent = getpid();
   pid_t pid = fork();
   if (pid == 0) {
@@ -59,8 +93,14 @@ WorkerPool::Process WorkerPool::Spawn(const std::string& socket_path) const {
     // would hold inherited descriptors (and a pool slot's socket) forever.
     prctl(PR_SET_PDEATHSIG, SIGKILL);
     if (getppid() != parent) _exit(0);
-    execl(self_exe_.c_str(), self_exe_.c_str(), "--worker",
-          socket_path.c_str(), static_cast<char*>(nullptr));
+    if (heartbeat[1] >= 0 && fcntl(heartbeat[1], F_SETFD, 0) == 0) {
+      execl(self_exe_.c_str(), self_exe_.c_str(), "--worker",
+            socket_path.c_str(), "--heartbeat-fd", heartbeat_arg.c_str(),
+            static_cast<char*>(nullptr));
+    } else {
+      execl(self_exe_.c_str(), self_exe_.c_str(), "--worker",
+            socket_path.c_str(), static_cast<char*>(nullptr));
+    }
     // Only reached when exec fails. The front is multithreaded, so the
     // child may only make async-signal-safe calls: write(2), not stdio.
     static constexpr char kExecFailed[] = "grpc-pdfium: exec of a worker failed\n";
@@ -69,6 +109,8 @@ WorkerPool::Process WorkerPool::Spawn(const std::string& socket_path) const {
     _exit(127);
   }
   process.pid = pid;
+  if (heartbeat[1] >= 0) close(heartbeat[1]);
+  process.heartbeat_fd = heartbeat[0];
   grpc::ChannelArguments args;
   // Fleet message-size convention; a page raster at model DPI must fit.
   args.SetMaxReceiveMessageSize(520 * 1024 * 1024);
@@ -106,6 +148,8 @@ WorkerPool::AcquireResult WorkerPool::Acquire(
       w.abandoned = false;
       w.stalled = false;
       w.call_cancelled = false;
+      // Heartbeats left from the previous lease are not this one's progress.
+      DrainHeartbeats(w.heartbeat_fd);
       *lease = Lease{static_cast<int>(i), w.stub.get()};
       return AcquireResult::kLeased;
     }
@@ -148,17 +192,21 @@ bool WorkerPool::Release(const Lease& lease, bool failed) {
   // would stall behind them. The slot stays busy meanwhile, and with no
   // call on it the watchdog leaves it alone.
   w.pid = -1;
+  const int old_heartbeat_fd = w.heartbeat_fd;
+  w.heartbeat_fd = -1;
   const std::string socket_path = w.socket_path;
   lock.unlock();
   if (pid > 0 && !reaped) {
     kill(pid, SIGKILL);
     waitpid(pid, nullptr, 0);
   }
+  if (old_heartbeat_fd >= 0) close(old_heartbeat_fd);
   Process process = Spawn(socket_path);
   lock.lock();
   w.pid = process.pid;
   w.channel = std::move(process.channel);
   w.stub = std::move(process.stub);
+  w.heartbeat_fd = process.heartbeat_fd;
   w.busy = false;
   lock.unlock();
   available_.notify_one();
@@ -191,6 +239,11 @@ void WorkerPool::Watch() {
       if (w.call->IsCancelled() && !w.abandoned) {
         w.abandoned = true;
         continue;
+      }
+      // A worker that loaded a page since the last look is making progress
+      // even when it has nothing to forward yet.
+      if (!w.abandoned && DrainHeartbeats(w.heartbeat_fd)) {
+        w.stall_deadline = now + stall_limit_;
       }
       const bool no_progress =
           stall_limit_.count() > 0 && now >= w.stall_deadline;

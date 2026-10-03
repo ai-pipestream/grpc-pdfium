@@ -28,6 +28,11 @@ class PdfiumEngine {
   // Pages the engine has loaded in this process. Tests and logging only.
   static uint64_t PageLoads();
 
+  // From here on, every page load writes one byte to fd, without blocking
+  // and ignoring failures: the worker's heartbeat, which the front's
+  // watchdog reads as progress (worker_pool.h). -1 turns it off.
+  static void SetHeartbeatFd(int fd);
+
   // Loads the document and fills the per-document capability verdicts.
   static void Probe(const ai::protomolt::parse::pdf::v1::PdfDocument& document,
                     ai::protomolt::parse::pdf::v1::BackendCapabilities* caps);
