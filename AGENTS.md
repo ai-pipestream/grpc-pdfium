@@ -33,6 +33,14 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   `GRPC_PDFIUM_CACHE_MAX_BYTES` (default 2 GiB). SHA-256 is boringssl's
   one-shot `SHA256()` (`src/sha256.*`), the TLS library gRPC already
   builds; do not add another crypto dependency.
+- The front bounds every worker lease (`src/proxy_service_impl.cpp`,
+  `src/worker_pool.*`): worker calls are made with
+  `ClientContext::FromServerContext`, so the client's deadline and
+  cancellation reach them; an abandoned call kills its worker; the wait for
+  a free worker ends at `GRPC_PDFIUM_QUEUE_TIMEOUT_S` (RESOURCE_EXHAUSTED);
+  and the pool watchdog kills a worker whose call forwards nothing for
+  `GRPC_PDFIUM_REQUEST_TIMEOUT_S` (DEADLINE_EXCEEDED). Both default to
+  300 s, 0 turns one off. Respawns run outside the pool lock.
 - Default port is 50069 (`GRPC_PDFIUM_PORT` overrides). 50051/50052/50053
   belong to gRParse, grPOIc, and grpc-libreoffice; the PDF backends own
   50069 (pdfium), 50070 (qparse), 50071 (poppler) in the workspace table.

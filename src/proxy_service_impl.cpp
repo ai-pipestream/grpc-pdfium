@@ -1,5 +1,7 @@
 #include "proxy_service_impl.h"
 
+#include <algorithm>
+#include <chrono>
 #include <memory>
 #include <string>
 
@@ -66,46 +68,121 @@ void FillVerdictCapabilities(pdfv1::BackendCapabilities* caps,
   caps->set_load_detail(detail);
 }
 
+// One forwarded call's view of the pool: the client call it serves and how
+// long it may wait for a free worker.
+struct Forwarding {
+  WorkerPool* pool;
+  grpc::ServerContext* context;
+  std::chrono::system_clock::time_point queue_deadline;
+};
+
+// A request waits for a free worker as long as its client does, and no
+// longer than queue_limit when one is set.
+Forwarding StartForwarding(WorkerPool* pool, grpc::ServerContext* context,
+                           std::chrono::seconds queue_limit) {
+  std::chrono::system_clock::time_point deadline = context->deadline();
+  if (queue_limit.count() > 0) {
+    deadline = std::min(deadline, std::chrono::system_clock::now() + queue_limit);
+  }
+  return Forwarding{pool, context, deadline};
+}
+
+grpc::Status AcquireWorker(const Forwarding& fwd, WorkerPool::Lease* lease) {
+  switch (fwd.pool->Acquire(fwd.queue_deadline, fwd.context, lease)) {
+    case WorkerPool::AcquireResult::kLeased:
+      return grpc::Status::OK;
+    case WorkerPool::AcquireResult::kCancelled:
+      return grpc::Status::CANCELLED;
+    case WorkerPool::AcquireResult::kTimedOut:
+      break;
+  }
+  return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                      "all " + std::to_string(fwd.pool->size()) +
+                          " workers stayed busy for the whole wait");
+}
+
+// The worker call inherits the client's deadline and cancellation, so a
+// client that gives up stops its worker call too.
+std::unique_ptr<grpc::ClientContext> WorkerContext(const Forwarding& fwd) {
+  return grpc::ClientContext::FromServerContext(*fwd.context);
+}
+
+// What one attempt on a worker comes to once the lease is released.
+struct Settled {
+  grpc::Status status;
+  // The worker failed before producing anything: the call may go to a
+  // fresh worker.
+  bool retry = false;
+};
+
+// Releases the lease of one finished attempt and decides the answer. A call
+// the client abandoned (it cancelled, its deadline passed, or it stopped
+// reading) may have left its worker inside the engine, so a worker call
+// that did not finish OK kills its worker: the slot frees now, not whenever
+// the engine returns. A lease the watchdog cut is never retried, since the
+// same request would stall again.
+Settled SettleAttempt(const Forwarding& fwd, const WorkerPool::Lease& lease,
+                      const grpc::Status& status, bool client_gone,
+                      bool forwarded_any) {
+  const bool abandoned =
+      client_gone || fwd.context->IsCancelled() ||
+      status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED;
+  const bool failed = abandoned ? !status.ok() : IsWorkerFailure(status);
+  if (fwd.pool->Release(lease, failed)) {
+    return {grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                         "the worker made no progress for " +
+                             std::to_string(fwd.pool->stall_limit().count()) +
+                             " s and was stopped")};
+  }
+  if (abandoned) {
+    return {client_gone || status.ok() ? grpc::Status::CANCELLED : status};
+  }
+  if (!failed) return {status};
+  if (forwarded_any) {
+    return {grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                         "worker failed mid-stream: " + status.error_message())};
+  }
+  return {grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                       "worker failed twice before producing a response"),
+          true};
+}
+
 // Forwards one server-streaming RPC through a leased worker. Retries once
 // on a fresh worker when the first attempt fails before any message was
 // forwarded.
 template <typename Request, typename Response, typename StartFn>
-grpc::Status ForwardStreaming(WorkerPool* pool, const Request& request,
+grpc::Status ForwardStreaming(const Forwarding& fwd, const Request& request,
                               grpc::ServerWriter<Response>* writer,
                               const StartFn& start) {
+  Settled settled;
   for (int attempt = 0; attempt < 2; ++attempt) {
-    WorkerPool::Lease lease = pool->Acquire();
-    grpc::ClientContext worker_ctx;
-    auto reader = start(lease.stub, &worker_ctx, request);
+    WorkerPool::Lease lease;
+    grpc::Status waited = AcquireWorker(fwd, &lease);
+    if (!waited.ok()) return waited;
+    std::unique_ptr<grpc::ClientContext> worker_ctx = WorkerContext(fwd);
+    auto reader = start(lease.stub, worker_ctx.get(), request);
     Response message;
     bool forwarded_any = false;
     bool client_gone = false;
     while (reader->Read(&message)) {
       if (!writer->Write(message)) {
         client_gone = true;
-        worker_ctx.TryCancel();
+        worker_ctx->TryCancel();
         break;
       }
       forwarded_any = true;
+      fwd.pool->Touch(lease);
     }
-    grpc::Status status = reader->Finish();
-    bool failed = IsWorkerFailure(status) && !client_gone;
-    pool->Release(lease, failed);
-    if (client_gone) return grpc::Status::CANCELLED;
-    if (!failed) return status;
-    if (forwarded_any) {
-      return grpc::Status(grpc::StatusCode::UNAVAILABLE,
-                          "worker failed mid-stream: " + status.error_message());
-    }
-    // Nothing was forwarded: safe to retry once on a fresh worker.
+    const grpc::Status status = reader->Finish();
+    settled = SettleAttempt(fwd, lease, status, client_gone, forwarded_any);
+    if (!settled.retry) break;
   }
-  return grpc::Status(grpc::StatusCode::UNAVAILABLE,
-                      "worker failed twice before producing a response");
+  return settled.status;
 }
 
 }  // namespace
 
-grpc::Status ProxyServiceImpl::Probe(grpc::ServerContext* /*context*/,
+grpc::Status ProxyServiceImpl::Probe(grpc::ServerContext* context,
                                      const pdfv1::ProbeRequest* request,
                                      pdfv1::ProbeResponse* response) {
   pdfv1::ProbeRequest resolved = *request;
@@ -125,19 +202,23 @@ grpc::Status ProxyServiceImpl::Probe(grpc::ServerContext* /*context*/,
     case ResolveResult::kReady:
       break;
   }
+  const Forwarding fwd = StartForwarding(pool_, context, queue_limit_);
+  Settled settled;
   for (int attempt = 0; attempt < 2; ++attempt) {
-    WorkerPool::Lease lease = pool_->Acquire();
-    grpc::ClientContext worker_ctx;
-    grpc::Status status = lease.stub->Probe(&worker_ctx, resolved, response);
-    bool failed = IsWorkerFailure(status);
-    pool_->Release(lease, failed);
-    if (!failed) return status;
+    WorkerPool::Lease lease;
+    grpc::Status waited = AcquireWorker(fwd, &lease);
+    if (!waited.ok()) return waited;
+    std::unique_ptr<grpc::ClientContext> worker_ctx = WorkerContext(fwd);
+    response->Clear();
+    const grpc::Status status =
+        lease.stub->Probe(worker_ctx.get(), resolved, response);
+    settled = SettleAttempt(fwd, lease, status, false, false);
+    if (!settled.retry) break;
   }
-  return grpc::Status(grpc::StatusCode::UNAVAILABLE,
-                      "worker failed twice before producing a response");
+  return settled.status;
 }
 
-grpc::Status ProxyServiceImpl::Parse(grpc::ServerContext* /*context*/,
+grpc::Status ProxyServiceImpl::Parse(grpc::ServerContext* context,
                                      const pdfv1::ParseRequest* request,
                                      grpc::ServerWriter<pdfv1::ParseResponse>* writer) {
   // A malformed request fails here, before it resolves bytes or leases a
@@ -165,12 +246,12 @@ grpc::Status ProxyServiceImpl::Parse(grpc::ServerContext* /*context*/,
     return grpc::Status::OK;
   }
   return ForwardStreaming(
-      pool_, resolved, writer,
+      StartForwarding(pool_, context, queue_limit_), resolved, writer,
       [](pdfv1::PdfBackendService::Stub* stub, grpc::ClientContext* ctx,
          const pdfv1::ParseRequest& req) { return stub->Parse(ctx, req); });
 }
 
-grpc::Status ProxyServiceImpl::Render(grpc::ServerContext* /*context*/,
+grpc::Status ProxyServiceImpl::Render(grpc::ServerContext* context,
                                       const pdfv1::RenderRequest* request,
                                       grpc::ServerWriter<pdfv1::RenderResponse>* writer) {
   grpc::Status checked = CheckRenderRequest(*request);
@@ -196,7 +277,7 @@ grpc::Status ProxyServiceImpl::Render(grpc::ServerContext* /*context*/,
     return grpc::Status::OK;
   }
   return ForwardStreaming(
-      pool_, resolved, writer,
+      StartForwarding(pool_, context, queue_limit_), resolved, writer,
       [](pdfv1::PdfBackendService::Stub* stub, grpc::ClientContext* ctx,
          const pdfv1::RenderRequest& req) { return stub->Render(ctx, req); });
 }

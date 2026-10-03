@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+
 #include <grpcpp/grpcpp.h>
 
 #include "ai/protomolt/parse/pdf/v1/pdf_backend_service.grpc.pb.h"
@@ -13,6 +15,12 @@ namespace grpc_pdfium {
 // failure before any response reached the client is retried once on a fresh
 // worker; a failure mid-stream surfaces to the client as UNAVAILABLE.
 //
+// Worker calls inherit the client's deadline and cancellation. A request
+// waits for a free worker no longer than its client does, nor than
+// queue_limit when that is set (then RESOURCE_EXHAUSTED); the pool's
+// watchdog ends a worker call that stops making progress
+// (DEADLINE_EXCEEDED).
+//
 // The front also owns the content-addressed document handshake
 // (PdfDocument.sha256): it verifies hashes, answers cache hits and misses,
 // and keeps the byte cache. Workers always receive full bytes and stay
@@ -20,8 +28,9 @@ namespace grpc_pdfium {
 class ProxyServiceImpl final
     : public ai::protomolt::parse::pdf::v1::PdfBackendService::Service {
  public:
-  ProxyServiceImpl(WorkerPool* pool, ByteCache* cache)
-      : pool_(pool), cache_(cache) {}
+  ProxyServiceImpl(WorkerPool* pool, ByteCache* cache,
+                   std::chrono::seconds queue_limit)
+      : pool_(pool), cache_(cache), queue_limit_(queue_limit) {}
 
   grpc::Status Probe(
       grpc::ServerContext* context,
@@ -50,6 +59,7 @@ class ProxyServiceImpl final
  private:
   WorkerPool* pool_;
   ByteCache* cache_;
+  std::chrono::seconds queue_limit_;
 };
 
 }  // namespace grpc_pdfium

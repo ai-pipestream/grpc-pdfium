@@ -7,17 +7,28 @@
 // (PdfDocument.sha256): the byte cache lives in the front, so these checks
 // must go through the real binary. The child runs with
 // GRPC_PDFIUM_CACHE_MAX_DOCUMENTS=2 so eviction is reachable.
+//
+// The last part runs fronts with one worker and short limits, and freezes
+// the worker with SIGSTOP the way a pathological document wedges one, to
+// check that deadlines, cancellation, the bounded wait for a worker and
+// the watchdog all free the pool.
 
+#include <dirent.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 
@@ -35,6 +46,111 @@ void Check(bool ok, const char* what) {
     std::fprintf(stderr, "FAIL: %s\n", what);
     ++failures;
   }
+}
+
+// A running front process and the port it bound.
+struct Front {
+  pid_t pid = -1;
+  int port = 0;
+  int out_fd = -1;
+};
+
+// Launches the front binary on an ephemeral port with extra environment and
+// reads its listening line for the bound port.
+Front StartFront(const char* binary,
+                 const std::vector<std::pair<const char*, const char*>>& env) {
+  Front front;
+  int out_pipe[2];
+  Check(pipe(out_pipe) == 0, "stdout pipe created");
+  front.pid = fork();
+  if (front.pid == 0) {
+    dup2(out_pipe[1], STDOUT_FILENO);
+    close(out_pipe[0]);
+    close(out_pipe[1]);
+    setenv("GRPC_PDFIUM_PORT", "0", 1);
+    for (const auto& [name, value] : env) setenv(name, value, 1);
+    execl(binary, binary, static_cast<char*>(nullptr));
+    std::perror("execl front");
+    _exit(127);
+  }
+  close(out_pipe[1]);
+  front.out_fd = out_pipe[0];
+  std::string line;
+  char c = 0;
+  while (read(front.out_fd, &c, 1) == 1 && c != '\n') line.push_back(c);
+  const char* marker = "listening on 0.0.0.0:";
+  size_t pos = line.find(marker);
+  if (pos != std::string::npos) {
+    front.port = std::atoi(line.c_str() + pos + std::strlen(marker));
+  }
+  Check(front.port > 0, "front reported its bound port");
+  return front;
+}
+
+void StopFront(Front* front) {
+  kill(front->pid, SIGTERM);
+  // The front owns worker children; give it a moment, then make sure it is
+  // gone either way.
+  int status = 0;
+  if (waitpid(front->pid, &status, WNOHANG) == 0) {
+    sleep(1);
+    if (waitpid(front->pid, &status, WNOHANG) == 0) {
+      kill(front->pid, SIGKILL);
+      waitpid(front->pid, &status, 0);
+    }
+  }
+  close(front->out_fd);
+}
+
+// The front's worker processes: its children, found through /proc.
+std::vector<pid_t> WorkerPids(pid_t front) {
+  std::vector<pid_t> pids;
+  DIR* proc = opendir("/proc");
+  if (proc == nullptr) return pids;
+  while (dirent* entry = readdir(proc)) {
+    const pid_t pid = std::atoi(entry->d_name);
+    if (pid <= 0) continue;
+    std::ifstream stat_file("/proc/" + std::to_string(pid) + "/stat");
+    std::string stat;
+    std::getline(stat_file, stat);
+    // Fields after the command name, which sits in parentheses: state, ppid.
+    const size_t close_paren = stat.rfind(')');
+    if (close_paren == std::string::npos) continue;
+    std::istringstream rest(stat.substr(close_paren + 1));
+    std::string state;
+    pid_t ppid = 0;
+    rest >> state >> ppid;
+    if (ppid == front) pids.push_back(pid);
+  }
+  closedir(proc);
+  return pids;
+}
+
+// Freezes the front's only worker, the way a document that never finishes
+// wedges one. The front's kill (SIGKILL) still ends it.
+bool FreezeWorker(pid_t front) {
+  const std::vector<pid_t> workers = WorkerPids(front);
+  return workers.size() == 1 && kill(workers[0], SIGSTOP) == 0;
+}
+
+std::unique_ptr<pdfv1::PdfBackendService::Stub> Dial(int port) {
+  return pdfv1::PdfBackendService::NewStub(
+      grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
+                          grpc::InsecureChannelCredentials()));
+}
+
+// A Probe of data with an optional deadline (zero means none).
+grpc::Status ProbeWithin(pdfv1::PdfBackendService::Stub* stub,
+                         const std::string& data,
+                         std::chrono::milliseconds deadline) {
+  grpc::ClientContext ctx;
+  if (deadline.count() > 0) {
+    ctx.set_deadline(std::chrono::system_clock::now() + deadline);
+  }
+  pdfv1::ProbeRequest request;
+  request.mutable_document()->set_data(data);
+  pdfv1::ProbeResponse response;
+  return stub->Probe(&ctx, request, &response);
 }
 
 }  // namespace
@@ -55,38 +171,10 @@ int main(int argc, char** argv) {
   }
   Check(!fixture.empty(), "fixture PDF read");
 
-  int out_pipe[2];
-  Check(pipe(out_pipe) == 0, "stdout pipe created");
-  pid_t front = fork();
-  if (front == 0) {
-    dup2(out_pipe[1], STDOUT_FILENO);
-    close(out_pipe[0]);
-    close(out_pipe[1]);
-    setenv("GRPC_PDFIUM_PORT", "0", 1);
-    setenv("GRPC_PDFIUM_WORKERS", "2", 1);
-    setenv("GRPC_PDFIUM_CACHE_MAX_DOCUMENTS", "2", 1);
-    execl(argv[1], argv[1], static_cast<char*>(nullptr));
-    std::perror("execl front");
-    _exit(127);
-  }
-  close(out_pipe[1]);
-
-  // Read the listening line to learn the bound port.
-  std::string line;
-  char c = 0;
-  while (read(out_pipe[0], &c, 1) == 1 && c != '\n') line.push_back(c);
-  const char* marker = "listening on 0.0.0.0:";
-  size_t pos = line.find(marker);
-  int port = 0;
-  if (pos != std::string::npos) {
-    port = std::atoi(line.c_str() + pos + std::strlen(marker));
-  }
-  Check(port > 0, "front reported its bound port");
-
-  if (port > 0) {
-    auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
-                                       grpc::InsecureChannelCredentials());
-    auto stub = pdfv1::PdfBackendService::NewStub(channel);
+  Front front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "2"},
+                                     {"GRPC_PDFIUM_CACHE_MAX_DOCUMENTS", "2"}});
+  if (front.port > 0) {
+    auto stub = Dial(front.port);
 
     {
       grpc::ClientContext ctx;
@@ -426,18 +514,109 @@ int main(int argc, char** argv) {
     }
   }
 
-  kill(front, SIGTERM);
-  // The front owns worker children; give it a moment, then make sure it is
-  // gone either way.
-  int status = 0;
-  if (waitpid(front, &status, WNOHANG) == 0) {
-    sleep(1);
-    if (waitpid(front, &status, WNOHANG) == 0) {
-      kill(front, SIGKILL);
-      waitpid(front, &status, 0);
+  StopFront(&front);
+
+  using std::chrono::milliseconds;
+  using std::chrono::seconds;
+
+  // One worker, a long watchdog limit and a three-second wait for a free
+  // worker: client deadlines and cancellation must reach the worker call,
+  // and the wait must end. Before, the front waited on a frozen worker
+  // forever and every later request queued behind it.
+  front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "1"},
+                               {"GRPC_PDFIUM_REQUEST_TIMEOUT_S", "60"},
+                               {"GRPC_PDFIUM_QUEUE_TIMEOUT_S", "3"}});
+  if (front.port > 0) {
+    auto stub = Dial(front.port);
+    Check(ProbeWithin(stub.get(), fixture, seconds(20)).ok(),
+          "one-worker front serves");
+
+    Check(FreezeWorker(front.pid), "worker frozen");
+    Check(ProbeWithin(stub.get(), fixture, seconds(1)).error_code() ==
+              grpc::StatusCode::DEADLINE_EXCEEDED,
+          "a frozen worker runs into the client's deadline");
+    Check(ProbeWithin(stub.get(), fixture, seconds(20)).ok(),
+          "the expired call's worker was replaced");
+
+    Check(FreezeWorker(front.pid), "worker frozen again");
+    {
+      grpc::ClientContext ctx;
+      pdfv1::ProbeRequest request;
+      request.mutable_document()->set_data(fixture);
+      pdfv1::ProbeResponse response;
+      std::thread canceller([&ctx] {
+        std::this_thread::sleep_for(milliseconds(500));
+        ctx.TryCancel();
+      });
+      const grpc::Status status = stub->Probe(&ctx, request, &response);
+      canceller.join();
+      Check(status.error_code() == grpc::StatusCode::CANCELLED,
+            "the client cancels its call to a frozen worker");
     }
+    Check(ProbeWithin(stub.get(), fixture, seconds(20)).ok(),
+          "the cancelled call's worker was replaced");
+
+    Check(FreezeWorker(front.pid), "worker frozen a third time");
+    grpc::Status held;
+    std::thread holder([&] { held = ProbeWithin(stub.get(), fixture, seconds(8)); });
+    std::this_thread::sleep_for(milliseconds(500));
+    const auto waited_from = std::chrono::steady_clock::now();
+    const grpc::Status queued = ProbeWithin(stub.get(), fixture, seconds(30));
+    const auto waited = std::chrono::steady_clock::now() - waited_from;
+    holder.join();
+    Check(queued.error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED,
+          "a request that finds every worker busy gets RESOURCE_EXHAUSTED");
+    Check(waited >= seconds(2) && waited < seconds(7),
+          "the wait for a worker ends at the queue limit");
+    Check(held.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED,
+          "the call holding the frozen worker hits its deadline");
+    Check(ProbeWithin(stub.get(), fixture, seconds(20)).ok(),
+          "the pool serves again after the frozen worker is replaced");
   }
-  close(out_pipe[0]);
+  StopFront(&front);
+
+  // A one-second watchdog: a call that makes no progress has its worker
+  // killed and ends DEADLINE_EXCEEDED although its client set no deadline,
+  // and the pool recovers on its own.
+  front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "1"},
+                               {"GRPC_PDFIUM_REQUEST_TIMEOUT_S", "1"}});
+  if (front.port > 0) {
+    auto stub = Dial(front.port);
+    Check(FreezeWorker(front.pid), "watchdog front's worker frozen");
+    const auto started = std::chrono::steady_clock::now();
+    const grpc::Status stalled = ProbeWithin(stub.get(), fixture, milliseconds(0));
+    const auto took = std::chrono::steady_clock::now() - started;
+    Check(stalled.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED,
+          "the watchdog ends a call whose worker makes no progress");
+    Check(took >= seconds(1) && took < seconds(15),
+          "the watchdog acts after its limit");
+    Check(ProbeWithin(stub.get(), fixture, seconds(20)).ok(),
+          "the watchdog's worker was replaced");
+
+    // A client that stops reading: the front blocks writing a 600 DPI raster
+    // (about 100 MB, more than any flow-control window) and the lease makes
+    // no progress, so the watchdog cuts the call itself.
+    grpc::ChannelArguments args;
+    args.SetMaxReceiveMessageSize(520 * 1024 * 1024);
+    auto raster_stub = pdfv1::PdfBackendService::NewStub(grpc::CreateCustomChannel(
+        "127.0.0.1:" + std::to_string(front.port),
+        grpc::InsecureChannelCredentials(), args));
+    grpc::ClientContext ctx;
+    pdfv1::RenderRequest request;
+    request.mutable_document()->set_data(fixture);
+    request.set_dpi(600.0);
+    auto reader = raster_stub->Render(&ctx, request);
+    std::this_thread::sleep_for(seconds(5));
+    pdfv1::RenderResponse message;
+    const bool read = reader->Read(&message);
+    const grpc::StatusCode cut = reader->Finish().error_code();
+    Check(!read && (cut == grpc::StatusCode::CANCELLED ||
+                    cut == grpc::StatusCode::DEADLINE_EXCEEDED),
+          "the watchdog cuts a call whose client stopped reading");
+    Check(ProbeWithin(stub.get(), fixture, seconds(20)).ok(),
+          "the pool serves again after the stalled client");
+  }
+  StopFront(&front);
 
   if (failures == 0) {
     std::printf("pool_roundtrip: all checks passed\n");

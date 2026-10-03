@@ -23,6 +23,15 @@ runs as a pool of single-threaded worker processes behind a gRPC front
 unix sockets, die with the front (`PR_SET_PDEATHSIG`), and a crash on a
 hostile document costs one worker, which is respawned.
 
+No request can hold a worker for good. A worker call inherits its client's
+deadline and cancellation, and a call the client abandons kills its worker,
+which is respawned. A request waits for a free worker no longer than its
+client does, nor than `GRPC_PDFIUM_QUEUE_TIMEOUT_S` (default 300), and then
+fails `RESOURCE_EXHAUSTED`. A watchdog kills a worker whose call forwards
+nothing for `GRPC_PDFIUM_REQUEST_TIMEOUT_S` (default 300); that call ends
+`DEADLINE_EXCEEDED` and the slot comes back respawned. 0 turns either limit
+off.
+
 The content-addressed handshake (`PdfDocument.sha256`) is served by the
 front process, which owns the client-facing wire: it verifies a supplied
 hash against the bytes (a mismatch answers `LOAD_STATUS_HASH_MISMATCH`),

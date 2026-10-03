@@ -1,5 +1,6 @@
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -39,6 +40,17 @@ int RunWorker(const std::string& socket_path) {
   return 0;
 }
 
+// A whole number of seconds from the environment; unset or unparsable
+// falls back to fallback_s.
+std::chrono::seconds SecondsFromEnv(const char* name, long long fallback_s) {
+  const char* env = std::getenv(name);
+  if (env == nullptr || *env == '\0') return std::chrono::seconds(fallback_s);
+  char* end = nullptr;
+  const long long value = std::strtoll(env, &end, 10);
+  if (*end != '\0' || value < 0) return std::chrono::seconds(fallback_s);
+  return std::chrono::seconds(value);
+}
+
 std::string SelfExe() {
   char buf[4096];
   ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
@@ -69,6 +81,15 @@ int RunFront() {
     cache_max_bytes = std::strtoull(env, nullptr, 10);
   }
 
+  // How long a worker call may go without forwarding a message before the
+  // watchdog kills its worker, and how long a request may wait for a free
+  // worker. 0 turns either limit off (a request then waits as long as its
+  // client does).
+  const std::chrono::seconds request_timeout =
+      SecondsFromEnv("GRPC_PDFIUM_REQUEST_TIMEOUT_S", 300);
+  const std::chrono::seconds queue_timeout =
+      SecondsFromEnv("GRPC_PDFIUM_QUEUE_TIMEOUT_S", 300);
+
   std::string socket_dir_template = "/tmp/grpc-pdfium-XXXXXX";
   char* socket_dir = mkdtemp(socket_dir_template.data());
   if (socket_dir == nullptr) {
@@ -79,9 +100,10 @@ int RunFront() {
   grpc::EnableDefaultHealthCheckService(true);
   grpc::reflection::InitProtoReflectionServerBuilderPlugin();
 
-  grpc_pdfium::WorkerPool pool(SelfExe(), socket_dir, pool_size);
+  grpc_pdfium::WorkerPool pool(SelfExe(), socket_dir, pool_size,
+                               request_timeout);
   grpc_pdfium::ByteCache byte_cache(cache_max_documents, cache_max_bytes);
-  grpc_pdfium::ProxyServiceImpl service(&pool, &byte_cache);
+  grpc_pdfium::ProxyServiceImpl service(&pool, &byte_cache, queue_timeout);
   grpc::ServerBuilder builder;
   builder.SetMaxReceiveMessageSize(kMaxMessageBytes);
   builder.SetMaxSendMessageSize(kMaxMessageBytes);
