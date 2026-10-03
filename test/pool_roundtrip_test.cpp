@@ -12,8 +12,11 @@
 // the worker with SIGSTOP the way a pathological document wedges one, to
 // check that deadlines, cancellation, the bounded wait for a worker and
 // the watchdog all free the pool.
-// A last front runs its worker under a 1 GiB address-space limit and feeds
-// it a decompression bomb, which must cost that worker and nothing more.
+// A front under a one-second watchdog parses a document whose page
+// inventory takes seconds, which the worker's progress signals must carry
+// through. A last front runs its worker under a 1 GiB address-space limit
+// and feeds it a decompression bomb, which must cost that worker and
+// nothing more.
 
 #include <dirent.h>
 #include <signal.h>
@@ -187,6 +190,46 @@ long PeakRssKib(pid_t pid) {
     if (line.rfind("VmHWM:", 0) == 0) return std::atol(line.c_str() + 6);
   }
   return -1;
+}
+
+// A fixture that sits next to the one at fixture_path.
+std::string ReadSibling(const std::string& fixture_path, const char* name) {
+  const std::string dir = fixture_path.substr(0, fixture_path.rfind('/') + 1);
+  std::ifstream in(dir + name, std::ios::binary);
+  std::ostringstream buf;
+  buf << in.rdbuf();
+  return buf.str();
+}
+
+// One Parse of the last page of a 100-page document (by hash alone when
+// data is empty), and how long it took. inventory is the header's page
+// count.
+struct TimedParse {
+  grpc::Status status;
+  int inventory = 0;
+  std::chrono::steady_clock::duration took{};
+};
+
+TimedParse ParseLastPage(pdfv1::PdfBackendService::Stub* stub,
+                         const std::string& data, const std::string& sha) {
+  TimedParse out;
+  const auto started = std::chrono::steady_clock::now();
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(120));
+  pdfv1::ParseRequest request;
+  request.mutable_document()->set_data(data);
+  request.mutable_document()->set_sha256(sha);
+  request.add_families(pdfv1::PDF_FAMILY_TEXT_CELLS);
+  request.mutable_pages()->set_begin(99);
+  request.mutable_pages()->set_end(100);
+  auto reader = stub->Parse(&ctx, request);
+  pdfv1::ParseResponse message;
+  while (reader->Read(&message)) {
+    if (message.has_header()) out.inventory = message.header().pages_size();
+  }
+  out.status = reader->Finish();
+  out.took = std::chrono::steady_clock::now() - started;
+  return out;
 }
 
 // A Probe of data with an optional deadline (zero means none).
@@ -754,6 +797,35 @@ int main(int argc, char** argv) {
   }
   StopFront(&front);
 
+  // A long document's first Parse: the page inventory loads all 100 pages
+  // before the header goes out, several seconds that forward nothing. The
+  // engine signals progress per page, so a one-second watchdog leaves the
+  // worker alone and its inventory cache survives for the next Parse of
+  // the same hash. Before, the watchdog killed the worker on every first
+  // Parse, and with it the cache, so the document could never be parsed.
+  {
+    const std::string slow = ReadSibling(argv[2], "slow-inventory.pdf");
+    Check(!slow.empty(), "slow-inventory fixture read");
+    front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "1"},
+                                 {"GRPC_PDFIUM_REQUEST_TIMEOUT_S", "1"}});
+    if (front.port > 0 && !slow.empty()) {
+      auto stub = Dial(front.port);
+      const std::string slow_sha = grpc_pdfium::Sha256Hex(slow);
+      const TimedParse first = ParseLastPage(stub.get(), slow, slow_sha);
+      Check(first.status.ok() && first.inventory == 100,
+            "a page inventory longer than the watchdog limit completes");
+      Check(first.took >= seconds(2),
+            "the fixture's inventory outlasts the watchdog limit (else this "
+            "check proves nothing)");
+      const TimedParse second = ParseLastPage(stub.get(), "", slow_sha);
+      Check(second.status.ok() && second.inventory == 100,
+            "the next Parse by hash is served");
+      Check(second.took * 2 < first.took,
+            "the next Parse by hash reuses the worker's inventory");
+    }
+    StopFront(&front);
+  }
+
   // A decompression bomb: about two kilobytes whose one attachment inflates
   // to 1 GiB, which PDFium decodes in full just to report its size (about
   // 2 GiB resident at the peak). A Parse that does not ask for attachment
@@ -762,12 +834,7 @@ int main(int argc, char** argv) {
   // dies; the call ends UNAVAILABLE, no worker ever holds more than the
   // limit, and the pool serves again.
   {
-    std::string fixture_dir = argv[2];
-    fixture_dir.erase(fixture_dir.rfind('/') + 1);
-    std::ifstream in(fixture_dir + "attachment-bomb.pdf", std::ios::binary);
-    std::ostringstream buf;
-    buf << in.rdbuf();
-    const std::string bomb = buf.str();
+    const std::string bomb = ReadSibling(argv[2], "attachment-bomb.pdf");
     Check(!bomb.empty(), "attachment-bomb fixture read");
 
     constexpr long kLimitKib = 1024 * 1024;

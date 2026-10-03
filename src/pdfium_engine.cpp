@@ -316,9 +316,16 @@ class InventoryCache {
   int total_pages_ = 0;
 };
 
+// PdfiumEngine::SetProgressHook's hook; empty until one is installed.
+std::function<void()>& ProgressHook() {
+  static std::function<void()> hook;
+  return hook;
+}
+
 // Fills the header inventory: every page's PageInfo, from the cache when
 // the document hash is known, else by loading each page in turn (one page
-// open at a time).
+// open at a time). Nothing streams until the header is out, so each page
+// loaded reports progress through the hook.
 void FillInventory(FPDF_DOCUMENT doc, const pdfv1::PdfDocument& document,
                    int page_count, InventoryCache::Pages* pages) {
   static InventoryCache cache;
@@ -329,9 +336,11 @@ void FillInventory(FPDF_DOCUMENT doc, const pdfv1::PdfDocument& document,
       return;
     }
   }
+  const std::function<void()>& progress = ProgressHook();
   for (int i = 0; i < page_count; ++i) {
     ScopedPage page(doc, i);
     if (page.get() != nullptr) FillPageInfo(page.get(), i, pages->Add());
+    if (progress) progress();
   }
   if (document.has_sha256()) {
     cache.Insert(document.sha256(), document.data().size(), page_count, *pages);
@@ -476,6 +485,10 @@ const char* PdfiumEngine::BackendName() { return kBackendName; }
 const char* PdfiumEngine::EngineVersion() { return kEngineVersion; }
 
 uint64_t PdfiumEngine::PageLoads() { return page_loads; }
+
+void PdfiumEngine::SetProgressHook(std::function<void()> hook) {
+  ProgressHook() = std::move(hook);
+}
 
 void PdfiumEngine::Probe(const pdfv1::PdfDocument& document,
                          pdfv1::BackendCapabilities* caps) {

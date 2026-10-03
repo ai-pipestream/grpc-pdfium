@@ -1,11 +1,15 @@
 #include "worker_pool.h"
 
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
@@ -13,6 +17,40 @@
 namespace grpc_pdfium {
 
 namespace pdfv1 = ai::protomolt::parse::pdf::v1;
+
+namespace {
+
+// The child side of a spawn: execs the worker, handing it its end of the
+// progress socket pair when there is one. The front is multithreaded, so
+// only async-signal-safe calls are made here (fcntl, execl, write, _exit).
+[[noreturn]] void ExecWorker(const char* exe, const char* socket_path,
+                             int progress_fd, const char* progress_arg) {
+  // Both ends were made close-on-exec, so a worker spawned by another
+  // thread meanwhile inherits neither; this child keeps its own end.
+  if (progress_fd >= 0 && fcntl(progress_fd, F_SETFD, 0) == 0) {
+    execl(exe, exe, "--worker", socket_path, "--progress-fd", progress_arg,
+          static_cast<char*>(nullptr));
+  } else {
+    execl(exe, exe, "--worker", socket_path, static_cast<char*>(nullptr));
+  }
+  // Only reached when exec fails: write(2), not stdio.
+  static constexpr char kExecFailed[] = "grpc-pdfium: exec of a worker failed\n";
+  ssize_t ignored = write(STDERR_FILENO, kExecFailed, sizeof(kExecFailed) - 1);
+  (void)ignored;
+  _exit(127);
+}
+
+// Reads every progress signal waiting on fd; true when there was one. The
+// socket is never blocked on: an empty queue ends the read (EAGAIN).
+bool DrainProgress(int fd) {
+  if (fd < 0) return false;
+  bool any = false;
+  char beat = 0;
+  while (recv(fd, &beat, 1, MSG_DONTWAIT) > 0) any = true;
+  return any;
+}
+
+}  // namespace
 
 WorkerPool::WorkerPool(std::string self_exe, std::string socket_dir, int size,
                        std::chrono::seconds stall_limit)
@@ -29,6 +67,7 @@ WorkerPool::WorkerPool(std::string self_exe, std::string socket_dir, int size,
     w.pid = process.pid;
     w.channel = std::move(process.channel);
     w.stub = std::move(process.stub);
+    w.progress_fd = process.progress_fd;
   }
   watchdog_ = std::thread([this] { Watch(); });
 }
@@ -46,12 +85,24 @@ WorkerPool::~WorkerPool() {
       waitpid(w.pid, nullptr, 0);
       unlink(w.socket_path.c_str());
     }
+    if (w.progress_fd >= 0) close(w.progress_fd);
   }
 }
 
 WorkerPool::Process WorkerPool::Spawn(const std::string& socket_path) const {
   unlink(socket_path.c_str());
   Process process;
+  // The worker's progress channel: pair[0] stays here, pair[1] goes to the
+  // worker. Without it the worker still serves, but a long page inventory
+  // counts against the stall limit as it did before the channel existed.
+  int pair[2] = {-1, -1};
+  if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, pair) != 0) {
+    std::cerr << "grpc-pdfium: worker progress socket pair failed: "
+              << std::strerror(errno) << std::endl;
+    pair[0] = pair[1] = -1;
+  }
+  // Formatted before the fork: the child may not allocate.
+  const std::string progress_arg = std::to_string(pair[1]);
   pid_t parent = getpid();
   pid_t pid = fork();
   if (pid == 0) {
@@ -59,15 +110,11 @@ WorkerPool::Process WorkerPool::Spawn(const std::string& socket_path) const {
     // would hold inherited descriptors (and a pool slot's socket) forever.
     prctl(PR_SET_PDEATHSIG, SIGKILL);
     if (getppid() != parent) _exit(0);
-    execl(self_exe_.c_str(), self_exe_.c_str(), "--worker",
-          socket_path.c_str(), static_cast<char*>(nullptr));
-    // Only reached when exec fails. The front is multithreaded, so the
-    // child may only make async-signal-safe calls: write(2), not stdio.
-    static constexpr char kExecFailed[] = "grpc-pdfium: exec of a worker failed\n";
-    ssize_t ignored = write(STDERR_FILENO, kExecFailed, sizeof(kExecFailed) - 1);
-    (void)ignored;
-    _exit(127);
+    ExecWorker(self_exe_.c_str(), socket_path.c_str(), pair[1],
+               progress_arg.c_str());
   }
+  if (pair[1] >= 0) close(pair[1]);
+  process.progress_fd = pair[0];
   process.pid = pid;
   grpc::ChannelArguments args;
   // Fleet message-size convention; a page raster at model DPI must fit.
@@ -102,6 +149,8 @@ WorkerPool::AcquireResult WorkerPool::Acquire(
       if (w.busy) continue;
       w.busy = true;
       w.call = call;
+      // Signals left from an earlier lease are not this lease's progress.
+      DrainProgress(w.progress_fd);
       w.stall_deadline = std::chrono::steady_clock::now() + stall_limit_;
       w.abandoned = false;
       w.stalled = false;
@@ -148,17 +197,21 @@ bool WorkerPool::Release(const Lease& lease, bool failed) {
   // would stall behind them. The slot stays busy meanwhile, and with no
   // call on it the watchdog leaves it alone.
   w.pid = -1;
+  const int progress_fd = w.progress_fd;
+  w.progress_fd = -1;
   const std::string socket_path = w.socket_path;
   lock.unlock();
   if (pid > 0 && !reaped) {
     kill(pid, SIGKILL);
     waitpid(pid, nullptr, 0);
   }
+  if (progress_fd >= 0) close(progress_fd);
   Process process = Spawn(socket_path);
   lock.lock();
   w.pid = process.pid;
   w.channel = std::move(process.channel);
   w.stub = std::move(process.stub);
+  w.progress_fd = process.progress_fd;
   w.busy = false;
   lock.unlock();
   available_.notify_one();
@@ -192,6 +245,8 @@ void WorkerPool::Watch() {
         w.abandoned = true;
         continue;
       }
+      // The engine signalled progress in a phase that forwards nothing.
+      if (DrainProgress(w.progress_fd)) w.stall_deadline = now + stall_limit_;
       const bool no_progress =
           stall_limit_.count() > 0 && now >= w.stall_deadline;
       if (!w.abandoned && !no_progress) continue;

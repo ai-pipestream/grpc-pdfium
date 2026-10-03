@@ -1,4 +1,5 @@
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -85,12 +86,54 @@ bool LimitWorkerMemory(uint64_t max_bytes) {
   return true;
 }
 
-int RunWorker(const std::string& socket_path) {
+// Tells the front's watchdog the engine is still working through a phase
+// that streams nothing (the page inventory), over the worker's end of the
+// progress socket pair. One signal per quarter second is plenty for a
+// watchdog that looks once a second. A full socket buffer (EAGAIN) means
+// signals are already waiting, so that is not a failure; any other error is
+// reported once, since the next signal would only repeat it.
+void SignalProgress(int fd) {
+  using Clock = std::chrono::steady_clock;
+  static Clock::time_point last_sent;
+  static bool reported = false;
+  const Clock::time_point now = Clock::now();
+  if (now - last_sent < std::chrono::milliseconds(250)) return;
+  last_sent = now;
+  const char beat = 1;
+  if (send(fd, &beat, 1, MSG_DONTWAIT | MSG_NOSIGNAL) < 0 && errno != EAGAIN &&
+      errno != EWOULDBLOCK && !reported) {
+    reported = true;
+    std::cerr << "worker progress signal failed: " << std::strerror(errno)
+              << std::endl;
+  }
+}
+
+// The descriptor after --progress-fd, or -1 (having said why) when it is
+// not one.
+int ProgressFdFromArg(const char* arg) {
+  char* end = nullptr;
+  errno = 0;
+  const long fd = std::strtol(arg, &end, 10);
+  if (*arg == '\0' || *end != '\0' || errno == ERANGE || fd < 0 ||
+      fd > INT32_MAX) {
+    std::cerr << "--progress-fd is not a descriptor: " << arg << std::endl;
+    return -1;
+  }
+  return static_cast<int>(fd);
+}
+
+// progress_fd is the worker's end of the front's progress socket pair, or
+// -1 when the front could not make one.
+int RunWorker(const std::string& socket_path, int progress_fd) {
   uint64_t max_bytes = 0;
   if (!WorkerMaxBytesFromEnv(&max_bytes) || !LimitWorkerMemory(max_bytes)) {
     return 1;
   }
   grpc_pdfium::PdfiumEngine::InitProcess();
+  if (progress_fd >= 0) {
+    grpc_pdfium::PdfiumEngine::SetProgressHook(
+        [progress_fd] { SignalProgress(progress_fd); });
+  }
   grpc_pdfium::PdfBackendServiceImpl service;
   grpc::ServerBuilder builder;
   builder.SetMaxReceiveMessageSize(kMaxMessageBytes);
@@ -217,7 +260,13 @@ int RunFront() {
 
 int main(int argc, char** argv) {
   if (argc == 3 && std::string(argv[1]) == "--worker") {
-    return RunWorker(argv[2]);
+    return RunWorker(argv[2], -1);
+  }
+  if (argc == 5 && std::string(argv[1]) == "--worker" &&
+      std::string(argv[3]) == "--progress-fd") {
+    const int progress_fd = ProgressFdFromArg(argv[4]);
+    if (progress_fd < 0) return 1;
+    return RunWorker(argv[2], progress_fd);
   }
   return RunFront();
 }

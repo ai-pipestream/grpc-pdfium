@@ -31,9 +31,18 @@ fails `RESOURCE_EXHAUSTED`. A watchdog kills a worker whose call forwards
 nothing for `GRPC_PDFIUM_REQUEST_TIMEOUT_S` (default 300); that call ends
 `DEADLINE_EXCEEDED`, or `CANCELLED` when the front was stuck writing to a
 client that stopped reading (the watchdog cancels that call), and the slot
-comes back respawned. 0 turns either limit
-off; each takes whole seconds up to 604800 (a week), and any other value
-stops the service at startup.
+comes back respawned. A first `Parse` of a long document loads every page
+for the header's inventory before it can forward anything; the engine
+signals the watchdog for each page it loads (over a socket pair the worker
+inherits as `--progress-fd`), so that phase is cut only when a single page
+stops it for the limit, not when the whole inventory takes longer. 0 turns
+either limit off; each takes whole seconds up to 604800 (a week), and any
+other value stops the service at startup.
+
+Raw byte strings the engine copies out of the document (link and outline
+URIs, a signature's `/SubFilter` and `/M`, font names) go into proto
+`string` fields as valid UTF-8: well-formed UTF-8 passes through, and each
+byte of an ill-formed sequence is read as Latin-1 (`src/utf8.*`).
 
 Each worker also runs under an address-space limit,
 `GRPC_PDFIUM_WORKER_MAX_BYTES` (bytes; default 3 GiB, 0 turns it off,
