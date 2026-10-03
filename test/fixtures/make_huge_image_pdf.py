@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Regenerates huge-image.pdf: one Letter page placing an image whose
-dictionary declares 60000 x 60000 RGB pixels (about 10.8 GB decoded) while
-its stream carries three bytes, the shape of a decompression bomb. The
+"""Regenerates huge-image.pdf: one Letter page placing a 9000 x 9000 RGB
+image (81 megapixels, about 324 MB as PDFium's bitmap) whose pixels are
+zero rows under two Flate filters, so the whole file is a few kilobytes: a
+decompression bomb PDFium really decodes when asked. The image is above the
+engine's 64-megapixel decode limit yet small enough to decode on a test
+machine, so without the limit its pixels would reach the message. The
 engine must report the placement and leave the pixels out, never decode
 them."""
 
+import zlib
 from pathlib import Path
+
+SIDE = 9000
 
 
 def stream(dict_body: bytes, data: bytes) -> bytes:
@@ -14,6 +20,11 @@ def stream(dict_body: bytes, data: bytes) -> bytes:
         b"stream\n" + data + b"\nendstream"
     )
 
+
+inner = zlib.compressobj(9)
+row = bytes(SIDE * 3)
+once = b"".join(inner.compress(row) for _ in range(SIDE)) + inner.flush()
+pixels = zlib.compress(once, 9)
 
 objects = [
     # 1: catalog
@@ -27,9 +38,11 @@ objects = [
     stream(b"", b"q 72 0 0 72 100 600 cm /Im0 Do Q"),
     # 5: the image
     stream(
-        b"/Type /XObject /Subtype /Image /Width 60000 /Height 60000 "
-        b"/ColorSpace /DeviceRGB /BitsPerComponent 8",
-        b"\xff\x00\x00",
+        b"/Type /XObject /Subtype /Image /Width " + str(SIDE).encode()
+        + b" /Height " + str(SIDE).encode()
+        + b" /ColorSpace /DeviceRGB /BitsPerComponent 8"
+        b" /Filter [/FlateDecode /FlateDecode]",
+        pixels,
     ),
 ]
 

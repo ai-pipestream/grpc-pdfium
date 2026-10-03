@@ -536,10 +536,12 @@ int main(int argc, char** argv) {
           "a font used only inside a form reaches the table");
   }
 
-  // huge-image.pdf: an image declaring 60000 x 60000 pixels (about 10.8 GB
-  // decoded) behind three bytes. With image data requested the placement is
-  // reported, the pixels are left out before anything is decoded, and the
-  // trailer says why.
+  // huge-image.pdf: a 9000 x 9000 image (81 megapixels, above the
+  // 64-megapixel decode limit) whose zero rows sit under two Flate filters
+  // in about a kilobyte. PDFium decodes it when asked, so without the limit
+  // its pixels would be in the chunk. With image data requested the
+  // placement is reported, the pixels are left out before anything is
+  // decoded, and the trailer says why.
   {
     grpc::ClientContext ctx;
     pdfv1::ParseRequest request;
@@ -554,8 +556,8 @@ int main(int argc, char** argv) {
       if (msg.has_trailer()) trailer = msg.trailer();
     }
     Check(reader->Finish().ok(), "huge-image Parse OK");
-    Check(page.images_size() == 1 && page.images(0).source_width_px() == 60000 &&
-              page.images(0).source_height_px() == 60000,
+    Check(page.images_size() == 1 && page.images(0).source_width_px() == 9000 &&
+              page.images(0).source_height_px() == 9000,
           "the oversized image's placement is reported");
     Check(page.images_size() == 1 && !page.images(0).has_image(),
           "the oversized image's pixels are left out");
