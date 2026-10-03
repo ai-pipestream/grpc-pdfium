@@ -352,6 +352,40 @@ int main(int argc, char** argv) {
           "locked document with the password: OK");
   }
 
+  // Render types the same password verdicts in its head (one message, then
+  // the stream ends OK), so a client can tell "needs a password" from a
+  // server fault; with the password it rasterizes.
+  {
+    auto render = [&stub](const std::string& data, const char* password,
+                          pdfv1::RenderResponse* first, int* messages) {
+      grpc::ClientContext ctx;
+      pdfv1::RenderRequest request;
+      request.mutable_document()->set_data(data);
+      if (password != nullptr) request.mutable_document()->set_password(password);
+      request.set_dpi(36.0);
+      auto reader = stub->Render(&ctx, request);
+      pdfv1::RenderResponse message;
+      *messages = 0;
+      while (reader->Read(&message)) {
+        if (++*messages == 1) *first = message;
+      }
+      return reader->Finish();
+    };
+    pdfv1::RenderResponse first;
+    int messages = 0;
+    Check(render(enc_locked, nullptr, &first, &messages).ok() && messages == 1 &&
+              first.has_head() &&
+              first.head().load_status() == pdfv1::LOAD_STATUS_PASSWORD_REQUIRED,
+          "locked Render without password: PASSWORD_REQUIRED in the head");
+    Check(render(enc_locked, "wrong", &first, &messages).ok() && messages == 1 &&
+              first.head().load_status() ==
+                  pdfv1::LOAD_STATUS_PASSWORD_INCORRECT,
+          "locked Render with a wrong password: PASSWORD_INCORRECT in the head");
+    Check(render(enc_locked, "secret", &first, &messages).ok() && messages == 1 &&
+              first.has_raster() && !first.has_head(),
+          "locked Render with the password rasterizes");
+  }
+
   server->Shutdown();
   if (failures == 0) {
     std::printf("tier12_fixture: all checks passed\n");

@@ -2,6 +2,8 @@
 
 #include <functional>
 
+#include <grpcpp/support/status.h>
+
 #include "ai/protomolt/parse/pdf/v1/pdf_backend_service.pb.h"
 
 namespace grpc_pdfium {
@@ -34,14 +36,15 @@ class PdfiumEngine {
       const std::function<
           bool(const ai::protomolt::parse::pdf::v1::ParseResponse&)>& emit);
 
-  // Renders the requested pages, invoking emit per raster. Fills a typed
-  // gRPC-style error into *error_message and returns false when the
-  // document cannot be rendered.
-  static bool Render(
+  // Renders the requested pages of a request that passed
+  // CheckRenderRequest, invoking emit per raster. A document that does not
+  // load is answered OK with one head message carrying the typed load
+  // status, as the contract requires. A raster above the byte ceiling is
+  // RESOURCE_EXHAUSTED; CANCELLED means emit returned false (client gone).
+  static grpc::Status Render(
       const ai::protomolt::parse::pdf::v1::RenderRequest& request,
       const std::function<
-          bool(const ai::protomolt::parse::pdf::v1::RenderResponse&)>& emit,
-      std::string* error_message);
+          bool(const ai::protomolt::parse::pdf::v1::RenderResponse&)>& emit);
 };
 
 }  // namespace grpc_pdfium

@@ -11,6 +11,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 
@@ -34,6 +35,34 @@ std::string ReadFile(const char* path) {
   std::ostringstream buf;
   buf << in.rdbuf();
   return buf.str();
+}
+
+// A one-page PDF with an empty page of the given size in points, with a
+// correct cross-reference table.
+std::string BlankPdf(int width_pts, int height_pts) {
+  const std::string objects[] = {
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " +
+          std::to_string(width_pts) + " " + std::to_string(height_pts) +
+          "] >>"};
+  std::string out = "%PDF-1.7\n";
+  std::vector<size_t> offsets;
+  for (size_t i = 0; i < std::size(objects); ++i) {
+    offsets.push_back(out.size());
+    out += std::to_string(i + 1) + " 0 obj\n" + objects[i] + "\nendobj\n";
+  }
+  const size_t xref = out.size();
+  out += "xref\n0 " + std::to_string(offsets.size() + 1) +
+         "\n0000000000 65535 f \n";
+  for (size_t offset : offsets) {
+    char line[24];
+    std::snprintf(line, sizeof(line), "%010zu 00000 n \n", offset);
+    out += line;
+  }
+  out += "trailer\n<< /Size " + std::to_string(offsets.size() + 1) +
+         " /Root 1 0 R >>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
+  return out;
 }
 
 }  // namespace
@@ -313,7 +342,8 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Render bytes that never loaded: FAILED_PRECONDITION.
+  // Render bytes that never loaded: the contract types the load failure in
+  // one head message and ends the stream OK, never a bare gRPC error.
   {
     grpc::ClientContext ctx;
     pdfv1::RenderRequest request;
@@ -321,9 +351,26 @@ int main(int argc, char** argv) {
     request.set_dpi(72.0);
     auto reader = stub->Render(&ctx, request);
     pdfv1::RenderResponse message;
-    Check(!reader->Read(&message), "unloadable render produced nothing");
-    Check(reader->Finish().error_code() == grpc::FAILED_PRECONDITION,
-          "unloadable document is FAILED_PRECONDITION");
+    Check(reader->Read(&message) && message.has_head() && !message.has_raster(),
+          "unloadable render answers with the head");
+    Check(message.head().load_status() == pdfv1::LOAD_STATUS_NOT_PDF,
+          "unloadable render head reports LOAD_STATUS_NOT_PDF");
+    Check(!reader->Read(&message), "unloadable render ends after the head");
+    Check(reader->Finish().ok(), "unloadable document is not a gRPC error");
+  }
+
+  // A raster above the 512 MiB ceiling (an A0 page at 400 DPI is about
+  // 744 MB of BGR) is RESOURCE_EXHAUSTED before any pixel is allocated.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::RenderRequest request;
+    request.mutable_document()->set_data(BlankPdf(2384, 3370));
+    request.set_dpi(400.0);
+    auto reader = stub->Render(&ctx, request);
+    pdfv1::RenderResponse message;
+    Check(!reader->Read(&message), "oversized raster is not sent");
+    Check(reader->Finish().error_code() == grpc::RESOURCE_EXHAUSTED,
+          "oversized raster is RESOURCE_EXHAUSTED");
   }
 
   server->Shutdown();

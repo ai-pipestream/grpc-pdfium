@@ -25,6 +25,11 @@ namespace {
 constexpr char kBackendName[] = "grpc-pdfium";
 constexpr char kEngineVersion[] = "pdfium 154.0.8035.0 (chromium/8035)";
 
+// The largest raster Render produces: one PageRaster must fit the fleet's
+// 520 MiB message limit, and the bitmap is allocated before it is filled,
+// so a larger page is refused before any pixel memory is taken.
+constexpr double kMaxRasterBytes = 512.0 * 1024 * 1024;
+
 // UTF-16 (host order, as PDFium emits) to UTF-8, surrogate pairs included.
 // Invalid sequences become U+FFFD rather than dropping text silently.
 std::string Utf16ToUtf8(const std::vector<unsigned short>& units) {
@@ -445,21 +450,19 @@ bool PdfiumEngine::Parse(
   return emit(trailer_msg);
 }
 
-bool PdfiumEngine::Render(
+grpc::Status PdfiumEngine::Render(
     const pdfv1::RenderRequest& request,
-    const std::function<bool(const pdfv1::RenderResponse&)>& emit,
-    std::string* error_message) {
-  if (request.dpi() <= 0.0) {
-    *error_message = "dpi must be positive";
-    return false;
-  }
+    const std::function<bool(const pdfv1::RenderResponse&)>& emit) {
   LoadedDocument loaded;
   LoadDocument(request.document(), &loaded);
   if (loaded.status != pdfv1::LOAD_STATUS_OK) {
-    *error_message = "document did not load: " +
-                     pdfv1::LoadStatus_Name(loaded.status) +
-                     (loaded.detail.empty() ? "" : " (" + loaded.detail + ")");
-    return false;
+    // A load failure is typed in the stream head, never a bare gRPC error:
+    // exactly one message, then the stream ends.
+    pdfv1::RenderResponse msg;
+    auto* head = msg.mutable_head();
+    head->set_load_status(loaded.status);
+    if (!loaded.detail.empty()) head->set_load_detail(loaded.detail);
+    return emit(msg) ? grpc::Status::OK : grpc::Status::CANCELLED;
   }
 
   const PageSpan span = SelectPages(request.has_pages(), request.pages(),
@@ -470,16 +473,31 @@ bool PdfiumEngine::Render(
   for (int i = span.begin; i < span.end; ++i) {
     FPDF_PAGE page = FPDF_LoadPage(loaded.doc, i);
     if (page == nullptr) continue;
-    int width = std::max(1, static_cast<int>(
-                                std::lround(FPDF_GetPageWidthF(page) * scale)));
-    int height = std::max(
-        1, static_cast<int>(std::lround(FPDF_GetPageHeightF(page) * scale)));
+    // Size the raster in floating point and check it against the ceiling
+    // before any int conversion or allocation. PDFium pads rows to 4 bytes.
+    const double width_px =
+        std::max(1.0, std::round(FPDF_GetPageWidthF(page) * scale));
+    const double height_px =
+        std::max(1.0, std::round(FPDF_GetPageHeightF(page) * scale));
+    const double row_bytes = std::ceil(width_px * (gray ? 1 : 3) / 4.0) * 4.0;
+    if (!(row_bytes * height_px <= kMaxRasterBytes)) {
+      FPDF_ClosePage(page);
+      return grpc::Status(
+          grpc::StatusCode::RESOURCE_EXHAUSTED,
+          "page " + std::to_string(i) + " at " + std::to_string(request.dpi()) +
+              " DPI is " + std::to_string(static_cast<int64_t>(width_px)) + "x" +
+              std::to_string(static_cast<int64_t>(height_px)) +
+              " pixels, above the 512 MiB raster limit");
+    }
+    const int width = static_cast<int>(width_px);
+    const int height = static_cast<int>(height_px);
     FPDF_BITMAP bitmap = FPDFBitmap_CreateEx(
         width, height, gray ? FPDFBitmap_Gray : FPDFBitmap_BGR, nullptr, 0);
     if (bitmap == nullptr) {
       FPDF_ClosePage(page);
-      *error_message = "bitmap allocation failed for page " + std::to_string(i);
-      return false;
+      return grpc::Status(
+          grpc::StatusCode::RESOURCE_EXHAUSTED,
+          "bitmap allocation failed for page " + std::to_string(i));
     }
     // Background: opaque white unless the request sets one. Gray output
     // collapses the color to its luma via the blue channel of FillRect's
@@ -512,9 +530,9 @@ bool PdfiumEngine::Render(
                        static_cast<size_t>(stride) * height);
     FPDFBitmap_Destroy(bitmap);
     FPDF_ClosePage(page);
-    if (!emit(msg)) return false;
+    if (!emit(msg)) return grpc::Status::CANCELLED;
   }
-  return true;
+  return grpc::Status::OK;
 }
 
 }  // namespace grpc_pdfium
