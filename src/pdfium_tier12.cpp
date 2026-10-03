@@ -1039,6 +1039,7 @@ std::optional<uint32_t> InternCharFont(
 
 bool EmitDocLevelFamilies(
     FPDF_DOCUMENT doc, const pdfv1::ParseRequest& request, const DocFacts& facts,
+    const CropOrigins& origins,
     const std::function<bool(const pdfv1::ParseResponse&)>& emit,
     std::vector<pdfv1::ParseWarning>* warnings) {
   if (WantFamily(request, pdfv1::PDF_FAMILY_DOC_METADATA)) {
@@ -1059,6 +1060,7 @@ bool EmitDocLevelFamilies(
          bookmark = FPDFBookmark_GetNextSibling(doc, bookmark)) {
       FillOutline(doc, bookmark, chunk->add_roots(), 0);
     }
+    ShiftToCropSpace(origins, chunk);
     if (!emit(msg)) return false;
   }
   if (facts.attachment_count > 0 &&

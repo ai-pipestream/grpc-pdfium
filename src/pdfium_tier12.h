@@ -11,6 +11,7 @@
 #include "ai/protomolt/parse/pdf/v1/pdf_backend_service.pb.h"
 #include "fpdf_text.h"
 #include "fpdfview.h"
+#include "page_space.h"
 
 namespace grpc_pdfium {
 
@@ -37,10 +38,11 @@ DocFacts GatherDocFacts(FPDF_DOCUMENT doc);
 // Emits the document-level families (metadata, encryption, outline,
 // attachments, signatures, javascript) that the request selected. Returns
 // false when emit returned false. Attachment bytes too large to send are
-// left out with a warning.
+// left out with a warning. Outline destinations are moved into their target
+// pages' CropBox frames by origins.
 bool EmitDocLevelFamilies(
     FPDF_DOCUMENT doc, const ai::protomolt::parse::pdf::v1::ParseRequest& request,
-    const DocFacts& facts,
+    const DocFacts& facts, const CropOrigins& origins,
     const std::function<
         bool(const ai::protomolt::parse::pdf::v1::ParseResponse&)>& emit,
     std::vector<ai::protomolt::parse::pdf::v1::ParseWarning>* warnings);

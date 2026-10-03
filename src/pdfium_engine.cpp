@@ -17,6 +17,7 @@
 #include "fpdf_text.h"
 #include "fpdf_transformpage.h"
 #include "fpdfview.h"
+#include "page_space.h"
 #include "pdfium_tier12.h"
 
 namespace grpc_pdfium {
@@ -172,10 +173,12 @@ void SetBox(pdfv1::BoundingBox* box, float left, float bottom, float right,
 // read only the page's own dictionary and miss a box set on a /Pages node.
 // FPDF_GetPageBoundingBox is the CropBox the renderer uses: inherited,
 // clipped to the MediaBox (14.11.2) and falling back to it, which is what
-// PageInfo.crop_box names and what the raster covers. Geometry stays in
-// untranslated user space; consumers place it against this box.
+// PageInfo.crop_box names and what the raster covers. Page geometry is
+// reported relative to this box (see page_space.h); the boxes themselves
+// stay as stored.
 void FillPageInfo(FPDF_PAGE page, int index, pdfv1::PageInfo* info) {
   info->set_page_index(static_cast<uint32_t>(index));
+  info->set_page_space(pdfv1::PAGE_SPACE_CROP_BOX);
   info->set_width_pts(FPDF_GetPageWidthF(page));
   info->set_height_pts(FPDF_GetPageHeightF(page));
   info->set_rotation_degrees(FPDFPage_GetRotation(page) * 90);
@@ -502,10 +505,11 @@ bool PdfiumEngine::Parse(
   const PageSpan span =
       SelectPages(request.has_pages(), request.pages(), page_count);
 
+  const CropOrigins origins = CropOriginsOf(header->pages());
   const tier12::DocFacts facts = tier12::GatherDocFacts(loaded.doc);
   std::vector<pdfv1::ParseWarning> warnings;
-  client_ok =
-      tier12::EmitDocLevelFamilies(loaded.doc, request, facts, emit, &warnings);
+  client_ok = tier12::EmitDocLevelFamilies(loaded.doc, request, facts, origins,
+                                           emit, &warnings);
 
   // Form-field access goes through a form-fill environment; a zeroed
   // struct with just the version is the read-only setup.
@@ -541,6 +545,7 @@ bool PdfiumEngine::Parse(
     }
     tier12::ExtractPageTier12(loaded.doc, page, form_handle, request, &fonts,
                               chunk, &new_fonts, &embedded_fonts, &warnings);
+    ShiftToCropSpace(origins, chunk);
     counts[pdfv1::PDF_FAMILY_PLACED_IMAGES] += chunk->images_size();
     counts[pdfv1::PDF_FAMILY_HYPERLINKS] += chunk->hyperlinks_size();
     counts[pdfv1::PDF_FAMILY_ANNOTATIONS] += chunk->annotations_size();

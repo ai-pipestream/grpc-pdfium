@@ -16,6 +16,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include "page_space.h"
 #include "pdf_backend_service_impl.h"
 #include "pdfium_engine.h"
 #include "sha256.h"
@@ -351,22 +352,22 @@ int main(int argc, char** argv) {
 
   // page-tree.pdf: boxes and rotation inherited through /Pages nodes reach
   // the inventory. crop_box is the box the renderer uses (inherited, clipped
-  // to the MediaBox); cells stay in untranslated user space, which is the
-  // frame consumers place against crop_box.
+  // to the MediaBox) and stays as stored; every geometry family is reported
+  // relative to it (PAGE_SPACE_CROP_BOX), before /Rotate, on the offset and
+  // the rotated pages alike.
   {
     grpc::ClientContext ctx;
     pdfv1::ParseRequest request;
     request.mutable_document()->set_data(page_tree);
-    request.add_families(pdfv1::PDF_FAMILY_TEXT_CELLS);
     auto reader = stub->Parse(&ctx, request);
     pdfv1::ParseResponse msg;
     pdfv1::ParseHeader header;
-    std::map<uint32_t, pdfv1::TextCell> first_cells;
+    pdfv1::OutlineChunk outline;
+    std::map<uint32_t, pdfv1::PageChunk> pages;
     while (reader->Read(&msg)) {
       if (msg.has_header()) header = msg.header();
-      if (msg.has_page() && msg.page().text_cells_size() > 0) {
-        first_cells[msg.page().page_index()] = msg.page().text_cells(0);
-      }
+      if (msg.has_outline()) outline = msg.outline();
+      if (msg.has_page()) pages[msg.page().page_index()] = msg.page();
     }
     Check(reader->Finish().ok(), "page-tree Parse OK");
     auto box_is = [](const pdfv1::BoundingBox& box, double x0, double y0,
@@ -374,6 +375,7 @@ int main(int argc, char** argv) {
       return box.x0() == x0 && box.y0() == y0 && box.x1() == x1 &&
              box.y1() == y1;
     };
+    auto near = [](double v, double want) { return v > want - 1 && v < want + 1; };
     Check(header.pages_size() == 4, "page-tree inventory lists four pages");
     if (header.pages_size() == 4) {
       const auto& p0 = header.pages(0);
@@ -399,12 +401,159 @@ int main(int argc, char** argv) {
       Check(box_is(p3.media_box(), 0, 0, 300, 400) &&
                 box_is(p3.crop_box(), 10, 20, 300, 400),
             "inherited CropBox clipped to the page's own MediaBox");
+      bool all_crop_space = true;
+      for (const auto& page : header.pages()) {
+        if (page.page_space() != pdfv1::PAGE_SPACE_CROP_BOX) {
+          all_crop_space = false;
+        }
+      }
+      Check(all_crop_space, "every page says PAGE_SPACE_CROP_BOX");
     }
-    Check(first_cells.size() == 4, "every page-tree page has a text cell");
-    Check(first_cells[1].text() == "cropped" &&
-              first_cells[1].bbox().x0() > 99.0 &&
-              first_cells[1].bbox().x0() < 101.0,
-          "cells stay in user space, not shifted by the CropBox origin");
+    Check(pages.size() == 4, "every page-tree page has a chunk");
+    auto first_cell = [&pages](uint32_t index) {
+      const auto& chunk = pages[index];
+      return chunk.text_cells_size() > 0 ? chunk.text_cells(0)
+                                         : pdfv1::TextCell();
+    };
+    // Text drawn at user x = 100, 100, 100, 50.
+    Check(first_cell(0).text() == "inherited" &&
+              near(first_cell(0).bbox().x0(), 100),
+          "zero-origin CropBox: the cell is where user space put it");
+    const pdfv1::TextCell cropped = first_cell(1);
+    Check(cropped.text() == "cropped" && near(cropped.bbox().x0(), 50) &&
+              near(cropped.quad().x0(), 50) && cropped.bbox().y0() < 500 &&
+              cropped.bbox().y1() > 500,
+          "offset CropBox: the cell is shifted by the CropBox origin");
+    const pdfv1::TextCell rotated = first_cell(2);
+    Check(rotated.text() == "rotated" && near(rotated.bbox().x0(), 90) &&
+              rotated.bbox().y0() < 480 && rotated.bbox().y1() > 480,
+          "rotated page: the cell is shifted, still before /Rotate");
+    Check(first_cell(3).text() == "own" && near(first_cell(3).bbox().x0(), 40),
+          "clipped inherited CropBox: the cell is shifted by its origin");
+    const auto& p1 = pages[1];
+    Check(p1.shapes_size() == 1 &&
+              box_is(p1.shapes(0).bbox(), 100, 100, 140, 130) &&
+              p1.shapes(0).segments_size() > 0 &&
+              p1.shapes(0).segments(0).has_move_to() &&
+              near(p1.shapes(0).segments(0).move_to().x(), 100) &&
+              near(p1.shapes(0).segments(0).move_to().y(), 100),
+          "offset CropBox: the shape and its path points are shifted");
+    Check(p1.hyperlinks_size() == 1 &&
+              box_is(p1.hyperlinks(0).bbox(), 150, 200, 210, 220),
+          "offset CropBox: the link region is shifted");
+    if (p1.hyperlinks_size() == 1) {
+      const auto& dest = p1.hyperlinks(0).destination();
+      Check(dest.page_index() == 2 && dest.has_x() && dest.has_y() &&
+                near(dest.x(), 100) && near(dest.y(), 490),
+            "link destination is shifted by its target page's CropBox");
+    }
+    Check(p1.annotations_size() == 1 &&
+              box_is(p1.annotations(0).rect(), 150, 200, 210, 220),
+          "offset CropBox: the annotation rect is shifted");
+    const auto& p2 = pages[2];
+    Check(p2.images_size() == 1 &&
+              box_is(p2.images(0).bbox(), 190, 280, 230, 310) &&
+              near(p2.images(0).quad().x0(), 190) &&
+              near(p2.images(0).quad().y0(), 280),
+          "rotated page: the image placement is shifted, before /Rotate");
+    Check(outline.roots_size() == 1 &&
+              outline.roots(0).destination().page_index() == 2 &&
+              near(outline.roots(0).destination().x(), 100) &&
+              near(outline.roots(0).destination().y(), 490),
+          "outline destination is shifted by its target page's CropBox");
+  }
+
+  // ShiftToCropSpace moves every geometry field of every page family,
+  // including form widgets and annotation quads the fixtures above do not
+  // place on an offset page, and leaves unset destination coordinates unset.
+  {
+    google::protobuf::RepeatedPtrField<pdfv1::PageInfo> inventory;
+    for (uint32_t i = 0; i < 2; ++i) {
+      auto* info = inventory.Add();
+      info->set_page_index(i);
+      auto* crop = info->mutable_crop_box();
+      crop->set_x0(10.0 * (i + 1));
+      crop->set_y0(20.0 * (i + 1));
+      crop->set_x1(500);
+      crop->set_y1(700);
+    }
+    const grpc_pdfium::CropOrigins origins =
+        grpc_pdfium::CropOriginsOf(inventory);
+    auto set_box = [](pdfv1::BoundingBox* box) {
+      box->set_x0(100);
+      box->set_y0(200);
+      box->set_x1(110);
+      box->set_y1(220);
+    };
+    auto set_quad = [](pdfv1::Quad* q) {
+      q->set_x0(100); q->set_y0(200); q->set_x1(110); q->set_y1(200);
+      q->set_x2(110); q->set_y2(220); q->set_x3(100); q->set_y3(220);
+    };
+    pdfv1::PageChunk chunk;
+    chunk.set_page_index(0);
+    auto* cell = chunk.add_text_cells();
+    set_box(cell->mutable_bbox());
+    set_quad(cell->mutable_quad());
+    auto* image = chunk.add_images();
+    set_box(image->mutable_bbox());
+    set_quad(image->mutable_quad());
+    auto* link = chunk.add_hyperlinks();
+    set_box(link->mutable_bbox());
+    link->mutable_destination()->set_page_index(1);
+    link->mutable_destination()->set_y(300);
+    auto* annot = chunk.add_annotations();
+    set_box(annot->mutable_rect());
+    set_quad(annot->add_quads());
+    auto* field = chunk.add_form_fields();
+    set_box(field->mutable_rect());
+    auto* shape = chunk.add_shapes();
+    set_box(shape->mutable_bbox());
+    auto* move = shape->add_segments()->mutable_move_to();
+    move->set_x(100);
+    move->set_y(200);
+    auto* cubic = shape->add_segments()->mutable_cubic_to();
+    cubic->mutable_control1()->set_x(100);
+    cubic->mutable_control1()->set_y(200);
+    cubic->mutable_control2()->set_x(100);
+    cubic->mutable_control2()->set_y(200);
+    cubic->mutable_end()->set_x(100);
+    cubic->mutable_end()->set_y(200);
+    shape->add_segments()->set_close(true);
+    grpc_pdfium::ShiftToCropSpace(origins, &chunk);
+    auto box_ok = [](const pdfv1::BoundingBox& b) {
+      return b.x0() == 90 && b.y0() == 180 && b.x1() == 100 && b.y1() == 200;
+    };
+    auto quad_ok = [](const pdfv1::Quad& q) {
+      return q.x0() == 90 && q.y0() == 180 && q.x1() == 100 && q.y1() == 180 &&
+             q.x2() == 100 && q.y2() == 200 && q.x3() == 90 && q.y3() == 200;
+    };
+    auto point_ok = [](const pdfv1::PathPoint& p) {
+      return p.x() == 90 && p.y() == 180;
+    };
+    Check(box_ok(cell->bbox()) && quad_ok(cell->quad()), "shift: text cell");
+    Check(box_ok(image->bbox()) && quad_ok(image->quad()), "shift: image");
+    Check(box_ok(link->bbox()), "shift: link region");
+    Check(!link->destination().has_x() && link->destination().y() == 260,
+          "shift: destination uses the target page, unset x stays unset");
+    Check(box_ok(annot->rect()) && quad_ok(annot->quads(0)),
+          "shift: annotation rect and quads");
+    Check(box_ok(field->rect()), "shift: form widget");
+    Check(box_ok(shape->bbox()) && point_ok(*move) &&
+              point_ok(cubic->control1()) && point_ok(cubic->control2()) &&
+              point_ok(cubic->end()) && shape->segments(2).has_close(),
+          "shift: shape bbox and every path point");
+    pdfv1::OutlineChunk outline;
+    auto* root = outline.add_roots();
+    root->mutable_destination()->set_page_index(0);
+    root->mutable_destination()->set_x(50);
+    auto* child = root->add_children();
+    child->mutable_destination()->set_page_index(1);
+    child->mutable_destination()->set_x(50);
+    child->mutable_destination()->set_y(50);
+    grpc_pdfium::ShiftToCropSpace(origins, &outline);
+    Check(root->destination().x() == 40 && !root->destination().has_y() &&
+              child->destination().x() == 30 && child->destination().y() == 10,
+          "shift: nested outline destinations use their target pages");
   }
 
   // Parse loads only the pages it needs. The header still lists every page,

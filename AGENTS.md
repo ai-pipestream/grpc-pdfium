@@ -21,6 +21,11 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   is load-bearing for gRParse's fold. Do not switch to tight-ink or
   line-level cells without running both the differential harness and a
   gRParse scorecard leg.
+- Page geometry is crop-relative (`PageInfo.page_space =
+  PAGE_SPACE_CROP_BOX`): every family is extracted in PDFium's user space
+  and shifted by the CropBox origin in one place, `src/page_space.*`, after
+  extraction. A new geometry field must be added there, or it ships in the
+  wrong frame.
 - The content-addressed handshake (`PdfDocument.sha256`, cache verdicts
   `LOAD_STATUS_BYTES_REQUIRED` / `LOAD_STATUS_HASH_MISMATCH`) lives in the
   FRONT process only (`src/proxy_service_impl.cpp`, `src/byte_cache.*`):

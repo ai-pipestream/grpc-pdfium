@@ -63,6 +63,15 @@ a loaded page, so each worker remembers the page inventory of the last few
 documents it parsed, keyed by the same hash; a client that parses one page
 per call pays a load of every page once per document, not once per call.
 
+Page geometry follows the contract frame: PDF user space before `/Rotate`,
+shifted so the CropBox's bottom-left corner is (0, 0). That holds for text
+cells and their quads, images, vector shapes, links, annotations, form
+widgets, and link and outline destinations (which use the frame of the page
+they target). Every `PageInfo` says so with `page_space =
+PAGE_SPACE_CROP_BOX`; its `media_box` and `crop_box` stay as stored. PDFium
+reports user space, so the engine shifts each finished page chunk once
+(`src/page_space.*`).
+
 ## Build and test
 
 ```bash
