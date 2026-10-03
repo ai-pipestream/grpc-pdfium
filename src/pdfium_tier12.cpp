@@ -15,6 +15,7 @@
 #include "fpdf_structtree.h"
 #include "fpdf_thumbnail.h"
 #include "fpdf_transformpage.h"
+#include "utf8.h"
 
 namespace grpc_pdfium {
 
@@ -834,7 +835,8 @@ constexpr int kDescriptorFlagBits = 0x7FFFF;
 // (base name, family, descriptor flags, whether a program is embedded) goes
 // into new_fonts and, when want_program is set, its embedded program into
 // embedded_fonts, so whichever path meets a font first leaves nothing for
-// the other to add.
+// the other to add. The interner keys on the raw name bytes; only the
+// names written into the table are made valid UTF-8 (ValidUtf8).
 uint32_t InternFont(FPDF_FONT font, const std::string& name, bool want_program,
                     FontInterner* fonts, pdfv1::FontTableChunk* new_fonts,
                     std::vector<pdfv1::EmbeddedFont>* embedded_fonts) {
@@ -844,12 +846,12 @@ uint32_t InternFont(FPDF_FONT font, const std::string& name, bool want_program,
   if (!is_new) return id;
   auto* ref = new_fonts->add_fonts();
   ref->set_font_id(id);
-  ref->set_base_name(name);
+  ref->set_base_name(ValidUtf8(name));
   if (flags >= 0) ref->set_descriptor_flags(static_cast<uint32_t>(flags));
   std::string family = ByteField([font](void* buf, unsigned long len) {
     return FPDFFont_GetFamilyName(font, static_cast<char*>(buf), len);
   });
-  if (!family.empty()) ref->set_family(family);
+  if (!family.empty()) ref->set_family(ValidUtf8(family));
   ref->set_embedded(FPDFFont_GetIsEmbedded(font) == 1);
   if (ref->embedded() && want_program) {
     size_t size = 0;
@@ -1031,7 +1033,7 @@ std::optional<uint32_t> InternCharFont(
   if (is_new) {
     auto* ref = new_fonts->add_fonts();
     ref->set_font_id(id);
-    ref->set_base_name(name);
+    ref->set_base_name(ValidUtf8(name));
     ref->set_descriptor_flags(static_cast<uint32_t>(flags));
   }
   return id;

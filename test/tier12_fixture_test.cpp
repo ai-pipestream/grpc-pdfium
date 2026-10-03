@@ -3,9 +3,11 @@
 // signed.pdf the signature field, the encrypted pair the encryption info
 // and the password load statuses, page-tree.pdf the page geometry a page
 // inherits through the page tree, form-xobject.pdf content nested in Form
-// XObjects and invisible text, and huge-image.pdf the image decode limit.
+// XObjects and invisible text, huge-image.pdf the image decode limit, and
+// font-names.pdf font names that are not valid UTF-8.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <map>
@@ -20,6 +22,7 @@
 #include "pdf_backend_service_impl.h"
 #include "pdfium_engine.h"
 #include "sha256.h"
+#include "utf8.h"
 
 namespace pdfv1 = ai::protomolt::parse::pdf::v1;
 
@@ -140,10 +143,30 @@ int main(int argc, char** argv) {
   const std::string page_tree = ReadFile(dir + "/page-tree.pdf");
   const std::string form_xobject = ReadFile(dir + "/form-xobject.pdf");
   const std::string huge_image = ReadFile(dir + "/huge-image.pdf");
+  const std::string font_names = ReadFile(dir + "/font-names.pdf");
   Check(!rich.empty() && !signed_doc.empty() && !enc_open.empty() &&
             !enc_locked.empty() && !page_tree.empty() && !form_xobject.empty() &&
-            !huge_image.empty(),
+            !huge_image.empty() && !font_names.empty(),
         "fixtures read");
+
+  // ValidUtf8: well-formed UTF-8 passes through; each byte of an
+  // ill-formed sequence (a GBK name, a truncated sequence, an overlong
+  // form, a surrogate) is read as Latin-1.
+  {
+    using grpc_pdfium::ValidUtf8;
+    Check(ValidUtf8("Helvetica") == "Helvetica", "ASCII passes through");
+    Check(ValidUtf8("\xE5\xAE\x8B\xE4\xBD\x93") == "\xE5\xAE\x8B\xE4\xBD\x93",
+          "well-formed UTF-8 passes through");
+    Check(ValidUtf8("\xCB\xCE\xCC\xE5") ==
+              "\xC3\x8B\xC3\x8E\xC3\x8C\xC3\xA5",
+          "GBK bytes read as Latin-1");
+    Check(ValidUtf8("A\xE5\xAE") == "A\xC3\xA5\xC2\xAE",
+          "a truncated sequence is read as Latin-1");
+    Check(ValidUtf8("\xC0\xAF") == "\xC3\x80\xC2\xAF",
+          "an overlong form is read as Latin-1");
+    Check(ValidUtf8("\xED\xA0\x80") == "\xC3\xAD\xC2\xA0\xC2\x80",
+          "a surrogate is read as Latin-1");
+  }
 
   grpc_pdfium::PdfBackendServiceImpl service;
   grpc::ServerBuilder builder;
@@ -185,6 +208,37 @@ int main(int argc, char** argv) {
     Check(SupportOf(caps, pdfv1::PDF_FAMILY_DEEP_RESOURCES) ==
               pdfv1::FAMILY_SUPPORT_UNSUPPORTED_BY_BACKEND,
           "deep resources declared unsupported by this engine");
+  }
+
+  // font-names.pdf: a GBK /BaseFont reaches the font table as valid UTF-8
+  // (Latin-1 per byte) and a UTF-8 one unchanged, so the stream parses on
+  // the client (a proto3 string with invalid UTF-8 fails the whole parse).
+  // Text cells and the font table both name fonts, through both paths.
+  // The deadline turns the old failure (the client stalls on the message
+  // it cannot parse) into a failed check.
+  {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(30));
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_data(font_names);
+    request.add_families(pdfv1::PDF_FAMILY_TEXT_CELLS);
+    request.add_families(pdfv1::PDF_FAMILY_FONTS);
+    auto reader = stub->Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    std::vector<std::string> names;
+    while (reader->Read(&msg)) {
+      if (msg.has_fonts()) {
+        for (const auto& f : msg.fonts().fonts()) names.push_back(f.base_name());
+      }
+    }
+    Check(reader->Finish().ok(), "font-names Parse OK");
+    auto has = [&names](const std::string& name) {
+      return std::find(names.begin(), names.end(), name) != names.end();
+    };
+    Check(has("\xC3\x8B\xC3\x8E\xC3\x8C\xC3\xA5"),
+          "GBK base font name arrives as Latin-1 UTF-8");
+    Check(has("\xE5\xAE\x8B\xE4\xBD\x93"),
+          "UTF-8 base font name arrives unchanged");
   }
 
   // Parse rich.pdf with heavy payloads: every claimed family delivers.

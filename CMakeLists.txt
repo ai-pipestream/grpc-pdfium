@@ -193,6 +193,7 @@ add_executable(grpc_pdfium
   src/pdfium_tier12.cpp
   src/proxy_service_impl.cpp
   src/sha256.cpp
+  src/utf8.cpp
   src/worker_pool.cpp)
 target_include_directories(grpc_pdfium PRIVATE src)
 # crypto is the boringssl target gRPC already builds (the module SSL
@@ -209,7 +210,8 @@ add_executable(pdf_backend_contract_test
   src/page_space.cpp
   src/pdf_backend_service_impl.cpp
   src/pdfium_engine.cpp
-  src/pdfium_tier12.cpp)
+  src/pdfium_tier12.cpp
+  src/utf8.cpp)
 target_include_directories(pdf_backend_contract_test PRIVATE src)
 target_link_libraries(pdf_backend_contract_test PRIVATE pdf_backend_proto pdfium grpc_pdfium_flags)
 add_test(NAME contract_roundtrip COMMAND pdf_backend_contract_test
@@ -221,7 +223,8 @@ add_executable(tier12_fixture_test
   src/pdf_backend_service_impl.cpp
   src/pdfium_engine.cpp
   src/pdfium_tier12.cpp
-  src/sha256.cpp)
+  src/sha256.cpp
+  src/utf8.cpp)
 target_include_directories(tier12_fixture_test PRIVATE src)
 target_link_libraries(tier12_fixture_test PRIVATE pdf_backend_proto pdfium crypto grpc_pdfium_flags)
 add_test(NAME tier12_fixture COMMAND tier12_fixture_test
