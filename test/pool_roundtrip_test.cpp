@@ -139,6 +139,16 @@ std::unique_ptr<pdfv1::PdfBackendService::Stub> Dial(int port) {
                           grpc::InsecureChannelCredentials()));
 }
 
+// A process's resident set size in KiB, from /proc.
+long RssKib(pid_t pid) {
+  std::ifstream status("/proc/" + std::to_string(pid) + "/status");
+  std::string line;
+  while (std::getline(status, line)) {
+    if (line.rfind("VmRSS:", 0) == 0) return std::atol(line.c_str() + 6);
+  }
+  return -1;
+}
+
 // A Probe of data with an optional deadline (zero means none).
 grpc::Status ProbeWithin(pdfv1::PdfBackendService::Stub* stub,
                          const std::string& data,
@@ -577,13 +587,17 @@ int main(int argc, char** argv) {
 
   // A worker call still sending a large request to a worker that stopped
   // reading does not end when its client goes away, so the watchdog kills
-  // the worker of a lease still held after its client left.
+  // the worker of a lease still held after its client left. Requests
+  // waiting for a worker meanwhile hold no copy of the document: a request
+  // addressed by hash gets the cached bytes filled in only once it leases a
+  // worker (before, every queued request held a full copy in the front).
   front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "1"},
                                {"GRPC_PDFIUM_REQUEST_TIMEOUT_S", "60"},
                                {"GRPC_PDFIUM_QUEUE_TIMEOUT_S", "60"}});
   if (front.port > 0) {
     auto stub = Dial(front.port);
-    const std::string big(16 << 20, 'x');
+    constexpr long kDocumentKib = 16 * 1024;
+    const std::string big(static_cast<size_t>(kDocumentKib) * 1024, 'x');
     const std::string big_sha = grpc_pdfium::Sha256Hex(big);
     auto probe_by_hash = [&stub, &big_sha](std::chrono::milliseconds deadline) {
       grpc::ClientContext ctx;
@@ -603,8 +617,23 @@ int main(int argc, char** argv) {
             "16 MiB document uploaded and cached");
     }
     Check(FreezeWorker(front.pid), "large-request worker frozen");
-    Check(probe_by_hash(seconds(2)).error_code() ==
-              grpc::StatusCode::DEADLINE_EXCEEDED,
+    // One request holds the frozen worker (with the one copy a worker call
+    // needs); eight more queue behind it.
+    grpc::Status held;
+    std::thread holder([&] { held = probe_by_hash(seconds(4)); });
+    std::this_thread::sleep_for(milliseconds(500));
+    const long rss_before = RssKib(front.pid);
+    std::vector<std::thread> queued;
+    for (int i = 0; i < 8; ++i) {
+      queued.emplace_back([&] { probe_by_hash(seconds(3)); });
+    }
+    std::this_thread::sleep_for(milliseconds(1500));
+    const long rss_queued = RssKib(front.pid);
+    for (auto& t : queued) t.join();
+    holder.join();
+    Check(rss_before > 0 && rss_queued - rss_before < 2 * kDocumentKib,
+          "requests queued by hash hold no copy of the document");
+    Check(held.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED,
           "a large request to a frozen worker runs into its deadline");
     Check(ProbeWithin(stub.get(), fixture, seconds(20)).ok(),
           "the pool serves again after the abandoned large request");
