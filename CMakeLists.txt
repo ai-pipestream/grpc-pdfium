@@ -48,6 +48,18 @@ FetchContent_Declare(grpc
   GIT_SHALLOW TRUE
   GIT_SUBMODULES_RECURSE TRUE)
 FetchContent_MakeAvailable(grpc)
+# A shallow clone needs a tag name, and a tag can move, so the checkout is
+# held to the commit v1.83.1 named when it was pinned. Bump both together.
+set(GRPC_COMMIT "aae267021b1ac256f8b9038d0ef528c3798cc137")
+find_package(Git REQUIRED)
+execute_process(
+  COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
+  WORKING_DIRECTORY "${grpc_SOURCE_DIR}"
+  OUTPUT_VARIABLE GRPC_CHECKED_OUT
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT GRPC_CHECKED_OUT STREQUAL GRPC_COMMIT)
+  message(FATAL_ERROR "gRPC checkout is ${GRPC_CHECKED_OUT}, expected ${GRPC_COMMIT}")
+endif()
 
 # ---------------------------------------------------------------------------
 # The PdfBackendService contract (package ai.protomolt.parse.pdf.v1),
