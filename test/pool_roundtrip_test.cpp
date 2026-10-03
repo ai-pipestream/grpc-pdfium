@@ -91,6 +91,32 @@ Front StartFront(const char* binary,
   return front;
 }
 
+// True when the front binary, run with extra environment, exits with a
+// failure status within ten seconds instead of starting to serve.
+bool RefusesToStart(
+    const char* binary,
+    const std::vector<std::pair<const char*, const char*>>& env) {
+  const pid_t pid = fork();
+  if (pid == 0) {
+    setenv("GRPC_PDFIUM_PORT", "0", 1);
+    setenv("GRPC_PDFIUM_WORKERS", "1", 1);
+    for (const auto& [name, value] : env) setenv(name, value, 1);
+    execl(binary, binary, static_cast<char*>(nullptr));
+    _exit(127);
+  }
+  int status = 0;
+  for (int i = 0; i < 100; ++i) {
+    if (waitpid(pid, &status, WNOHANG) == pid) {
+      return WIFEXITED(status) && WEXITSTATUS(status) != 0 &&
+             WEXITSTATUS(status) != 127;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  kill(pid, SIGKILL);
+  waitpid(pid, &status, 0);
+  return false;
+}
+
 void StopFront(Front* front) {
   kill(front->pid, SIGTERM);
   // The front owns worker children; give it a moment, then make sure it is
@@ -542,6 +568,19 @@ int main(int argc, char** argv) {
 
   using std::chrono::milliseconds;
   using std::chrono::seconds;
+
+  // Limits that are not counts, or so large that adding them to a clock
+  // would overflow it and put every deadline in the past, stop the front at
+  // startup instead of being replaced or wrapping.
+  Check(RefusesToStart(argv[1], {{"GRPC_PDFIUM_REQUEST_TIMEOUT_S", "10000000000"}}),
+        "a request timeout past the ceiling stops the start");
+  Check(RefusesToStart(argv[1],
+                       {{"GRPC_PDFIUM_QUEUE_TIMEOUT_S", "99999999999999999999"}}),
+        "a queue timeout that overflows strtoll stops the start");
+  Check(RefusesToStart(argv[1], {{"GRPC_PDFIUM_REQUEST_TIMEOUT_S", "5m"}}),
+        "a timeout that is not a number stops the start");
+  Check(RefusesToStart(argv[1], {{"GRPC_PDFIUM_WORKER_MAX_BYTES", "1000"}}),
+        "a worker limit below the minimum stops the start");
 
   // One worker, a long watchdog limit and a three-second wait for a free
   // worker: client deadlines and cancellation must reach the worker call,

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
@@ -106,14 +107,28 @@ int RunWorker(const std::string& socket_path) {
   return 0;
 }
 
-// A whole number of seconds from the environment; unset or unparsable
-// falls back to fallback_s.
-std::chrono::seconds SecondsFromEnv(const char* name, long long fallback_s) {
+// The longest limit a seconds setting accepts. Far above any sane watchdog
+// or queue wait, and far below the point where adding it to a clock's
+// now() would overflow the clock's nanosecond count (about 292 years) and
+// put the deadline in the past, which would cut every call at once.
+constexpr long long kMaxLimitSeconds = 7LL * 24 * 3600;
+
+// A whole number of seconds from the environment, fallback_s when unset.
+// A value that is not a count of seconds, or above kMaxLimitSeconds, is
+// refused (nullopt, having said why) rather than replaced.
+std::optional<std::chrono::seconds> SecondsFromEnv(const char* name,
+                                                   long long fallback_s) {
   const char* env = std::getenv(name);
-  if (env == nullptr || *env == '\0') return std::chrono::seconds(fallback_s);
+  if (env == nullptr) return std::chrono::seconds(fallback_s);
   char* end = nullptr;
+  errno = 0;
   const long long value = std::strtoll(env, &end, 10);
-  if (*end != '\0' || value < 0) return std::chrono::seconds(fallback_s);
+  if (*env == '\0' || *end != '\0' || errno == ERANGE || value < 0 ||
+      value > kMaxLimitSeconds) {
+    std::cerr << name << " must be a whole number of seconds from 0 (off) to "
+              << kMaxLimitSeconds << ", got \"" << env << "\"" << std::endl;
+    return std::nullopt;
+  }
   return std::chrono::seconds(value);
 }
 
@@ -151,10 +166,11 @@ int RunFront() {
   // watchdog kills its worker, and how long a request may wait for a free
   // worker. 0 turns either limit off (a request then waits as long as its
   // client does).
-  const std::chrono::seconds request_timeout =
+  const std::optional<std::chrono::seconds> request_timeout =
       SecondsFromEnv("GRPC_PDFIUM_REQUEST_TIMEOUT_S", 300);
-  const std::chrono::seconds queue_timeout =
+  const std::optional<std::chrono::seconds> queue_timeout =
       SecondsFromEnv("GRPC_PDFIUM_QUEUE_TIMEOUT_S", 300);
+  if (!request_timeout || !queue_timeout) return 1;
 
   // Workers read the limit themselves; checked here so a bad value fails
   // the start, not every spawn.
@@ -172,9 +188,9 @@ int RunFront() {
   grpc::reflection::InitProtoReflectionServerBuilderPlugin();
 
   grpc_pdfium::WorkerPool pool(SelfExe(), socket_dir, pool_size,
-                               request_timeout);
+                               *request_timeout);
   grpc_pdfium::ByteCache byte_cache(cache_max_documents, cache_max_bytes);
-  grpc_pdfium::ProxyServiceImpl service(&pool, &byte_cache, queue_timeout);
+  grpc_pdfium::ProxyServiceImpl service(&pool, &byte_cache, *queue_timeout);
   grpc::ServerBuilder builder;
   builder.SetMaxReceiveMessageSize(kMaxMessageBytes);
   builder.SetMaxSendMessageSize(kMaxMessageBytes);

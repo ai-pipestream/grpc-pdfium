@@ -40,7 +40,8 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   a free worker ends at `GRPC_PDFIUM_QUEUE_TIMEOUT_S` (RESOURCE_EXHAUSTED);
   and the pool watchdog kills a worker whose call forwards nothing for
   `GRPC_PDFIUM_REQUEST_TIMEOUT_S` (DEADLINE_EXCEEDED). Both default to
-  300 s, 0 turns one off. Respawns run outside the pool lock.
+  300 s, 0 turns one off, and a value that is not whole seconds up to a
+  week stops the start. Respawns run outside the pool lock.
   Each worker caps its own address space at
   `GRPC_PDFIUM_WORKER_MAX_BYTES` (default 3 GiB, 0 off) and disables core
   dumps (`src/main.cpp`): PDFium decodes whole streams with no size check
