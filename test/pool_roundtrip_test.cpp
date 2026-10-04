@@ -927,7 +927,9 @@ int main(int argc, char** argv) {
   // across calls spaced out enough for the server to shut threads down.
   {
     const std::string bomb = ReadSibling(argv[2], "attachment-bomb.pdf");
-    front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "2"}});
+    // The 1 GiB limit makes the bomb fatal on any host, as above.
+    front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "2"},
+                                 {"GRPC_PDFIUM_WORKER_MAX_BYTES", "1073741824"}});
     if (front.port > 0 && !bomb.empty()) {
       auto stub = Dial(front.port);
       {
