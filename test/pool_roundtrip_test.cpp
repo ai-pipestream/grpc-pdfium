@@ -920,33 +920,55 @@ int main(int argc, char** argv) {
 
   // A respawned worker outlives the gRPC thread that respawned it. The
   // worker's parent-death signal follows the thread that forked it, and the
-  // synchronous server retires the threads that served a call, so a worker
-  // forked on one was killed seconds after it came up and its slot failed
-  // the next call. Kill the one worker so the next call respawns it, then
-  // give the server time to retire threads and check it is still there.
+  // synchronous server shuts down threads it no longer needs, so a worker
+  // forked on one exited seconds after it came up and the next call routed
+  // to it failed. A decompression bomb costs one worker, which the call's
+  // own thread respawns; the pool must then keep the same live workers
+  // across calls spaced out enough for the server to shut threads down.
   {
-    front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "1"}});
-    if (front.port > 0) {
+    const std::string bomb = ReadSibling(argv[2], "attachment-bomb.pdf");
+    front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "2"}});
+    if (front.port > 0 && !bomb.empty()) {
       auto stub = Dial(front.port);
-      const std::vector<pid_t> before = WorkerPids(front.pid);
-      Check(before.size() == 1 && kill(before[0], SIGKILL) == 0,
-            "the one worker is killed");
-      Check(ProbeWithin(stub.get(), fixture, std::chrono::seconds(20)).ok(),
-            "the call after the kill is served by a respawned worker");
-      for (int round = 0; round < 3; ++round) {
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        Check(ProbeWithin(stub.get(), fixture, std::chrono::seconds(20)).ok(),
-              "the respawned worker keeps serving");
+      {
+        // Calls beside the bomb make the server start threads it shuts
+        // down once they are idle again; the bomb's respawn runs on one.
+        std::vector<std::thread> beside;
+        for (int call = 0; call < 6; ++call) {
+          beside.emplace_back([&] {
+            auto caller = Dial(front.port);
+            (void)ProbeWithin(caller.get(), fixture, std::chrono::seconds(30));
+          });
+        }
+        grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(60));
+        pdfv1::ParseRequest request;
+        request.mutable_document()->set_data(bomb);
+        request.add_families(pdfv1::PDF_FAMILY_ATTACHMENTS);
+        request.mutable_options()->set_include_attachment_data(true);
+        auto reader = stub->Parse(&ctx, request);
+        pdfv1::ParseResponse message;
+        while (reader->Read(&message)) {
+        }
+        Check(reader->Finish().error_code() == grpc::StatusCode::UNAVAILABLE,
+              "the bomb costs a worker");
+        for (std::thread& caller : beside) caller.join();
       }
-      std::this_thread::sleep_for(std::chrono::seconds(2));
-      const std::vector<pid_t> after = WorkerPids(front.pid);
-      Check(after.size() == 1 && after[0] != before[0] && Running(after[0]),
-            "the respawned worker is still running after its thread retires");
-      std::vector<pid_t> live = after;
-      live.erase(std::remove_if(live.begin(), live.end(),
-                                [](pid_t pid) { return !Running(pid); }),
-                 live.end());
-      Check(live == after, "no worker of the front is a zombie");
+      Check(ProbeWithin(stub.get(), fixture, std::chrono::seconds(20)).ok(),
+            "the pool serves after the bomb");
+      const std::vector<pid_t> respawned = WorkerPids(front.pid);
+      bool all_served = true;
+      for (int call = 0; call < 4; ++call) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        // A new connection per call, as independent clients make them.
+        auto caller = Dial(front.port);
+        all_served = ProbeWithin(caller.get(), fixture, std::chrono::seconds(20)).ok() && all_served;
+      }
+      Check(all_served, "calls spaced out after a respawn are served");
+      const std::vector<pid_t> later = WorkerPids(front.pid);
+      Check(respawned.size() == 2 && later == respawned &&
+                std::ranges::all_of(later, [](pid_t pid) { return Running(pid); }),
+            "the respawned worker is still the same running process seconds later");
     }
     StopFront(&front);
   }
