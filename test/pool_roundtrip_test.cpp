@@ -159,6 +159,20 @@ std::vector<pid_t> WorkerPids(pid_t front) {
   return pids;
 }
 
+// Whether pid is a live process rather than a zombie its parent has not
+// reaped, from /proc.
+bool Running(pid_t pid) {
+  std::ifstream stat_file("/proc/" + std::to_string(pid) + "/stat");
+  std::string stat;
+  std::getline(stat_file, stat);
+  const size_t close_paren = stat.rfind(')');
+  if (close_paren == std::string::npos) return false;
+  std::istringstream rest(stat.substr(close_paren + 1));
+  std::string state;
+  rest >> state;
+  return !state.empty() && state != "Z" && state != "X";
+}
+
 // Freezes the front's only worker, the way a document that never finishes
 // wedges one. The front's kill (SIGKILL) still ends it.
 bool FreezeWorker(pid_t front) {
@@ -900,6 +914,39 @@ int main(int argc, char** argv) {
             "the bomb's worker stays under its address-space limit");
       Check(ProbeWithin(stub.get(), fixture, std::chrono::seconds(20)).ok(),
             "the pool serves again after the bomb");
+    }
+    StopFront(&front);
+  }
+
+  // A respawned worker outlives the gRPC thread that respawned it. The
+  // worker's parent-death signal follows the thread that forked it, and the
+  // synchronous server retires the threads that served a call, so a worker
+  // forked on one was killed seconds after it came up and its slot failed
+  // the next call. Kill the one worker so the next call respawns it, then
+  // give the server time to retire threads and check it is still there.
+  {
+    front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "1"}});
+    if (front.port > 0) {
+      auto stub = Dial(front.port);
+      const std::vector<pid_t> before = WorkerPids(front.pid);
+      Check(before.size() == 1 && kill(before[0], SIGKILL) == 0,
+            "the one worker is killed");
+      Check(ProbeWithin(stub.get(), fixture, std::chrono::seconds(20)).ok(),
+            "the call after the kill is served by a respawned worker");
+      for (int round = 0; round < 3; ++round) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        Check(ProbeWithin(stub.get(), fixture, std::chrono::seconds(20)).ok(),
+              "the respawned worker keeps serving");
+      }
+      std::this_thread::sleep_for(std::chrono::seconds(2));
+      const std::vector<pid_t> after = WorkerPids(front.pid);
+      Check(after.size() == 1 && after[0] != before[0] && Running(after[0]),
+            "the respawned worker is still running after its thread retires");
+      std::vector<pid_t> live = after;
+      live.erase(std::remove_if(live.begin(), live.end(),
+                                [](pid_t pid) { return !Running(pid); }),
+                 live.end());
+      Check(live == after, "no worker of the front is a zombie");
     }
     StopFront(&front);
   }

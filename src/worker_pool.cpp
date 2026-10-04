@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
@@ -57,13 +58,24 @@ WorkerPool::WorkerPool(std::string self_exe, std::string socket_dir, int size,
     : self_exe_(std::move(self_exe)),
       socket_dir_(std::move(socket_dir)),
       stall_limit_(stall_limit) {
+  forker_ = std::thread([this] { Fork(); });
   if (size < 1) size = 1;
   workers_.resize(static_cast<size_t>(size));
   for (int i = 0; i < size; ++i) {
     Worker& w = workers_[static_cast<size_t>(i)];
     w.socket_path = socket_dir_ + "/worker-" + std::to_string(i) + ".sock";
     Process process = Spawn(w.socket_path);
-    if (process.pid < 0) throw std::runtime_error("fork failed for worker");
+    if (process.pid < 0) {
+      // The destructor does not run for a constructor that throws; stop the
+      // forker here, since a joinable thread member would terminate.
+      {
+        std::lock_guard<std::mutex> lock(fork_mutex_);
+        fork_stopping_ = true;
+      }
+      fork_cv_.notify_all();
+      forker_.join();
+      throw std::runtime_error("fork failed for worker");
+    }
     w.pid = process.pid;
     w.channel = std::move(process.channel);
     w.stub = std::move(process.stub);
@@ -87,9 +99,39 @@ WorkerPool::~WorkerPool() {
     }
     if (w.progress_fd >= 0) close(w.progress_fd);
   }
+  {
+    std::lock_guard<std::mutex> lock(fork_mutex_);
+    fork_stopping_ = true;
+  }
+  fork_cv_.notify_all();
+  if (forker_.joinable()) forker_.join();
 }
 
-WorkerPool::Process WorkerPool::Spawn(const std::string& socket_path) const {
+void WorkerPool::Fork() {
+  std::unique_lock<std::mutex> lock(fork_mutex_);
+  for (;;) {
+    fork_cv_.wait(lock, [this] { return fork_stopping_ || !fork_jobs_.empty(); });
+    if (fork_jobs_.empty()) return;
+    std::function<void()> job = std::move(fork_jobs_.front());
+    fork_jobs_.pop_front();
+    lock.unlock();
+    job();
+    lock.lock();
+  }
+}
+
+pid_t WorkerPool::ForkOnForker(const std::function<pid_t()>& fork_child) {
+  std::packaged_task<pid_t()> task(fork_child);
+  std::future<pid_t> pid = task.get_future();
+  {
+    std::lock_guard<std::mutex> lock(fork_mutex_);
+    fork_jobs_.emplace_back([&task] { task(); });
+  }
+  fork_cv_.notify_one();
+  return pid.get();
+}
+
+WorkerPool::Process WorkerPool::Spawn(const std::string& socket_path) {
   unlink(socket_path.c_str());
   Process process;
   // The worker's progress channel: pair[0] stays here, pair[1] goes to the
@@ -103,16 +145,21 @@ WorkerPool::Process WorkerPool::Spawn(const std::string& socket_path) const {
   }
   // Formatted before the fork: the child may not allocate.
   const std::string progress_arg = std::to_string(pair[1]);
-  pid_t parent = getpid();
-  pid_t pid = fork();
-  if (pid == 0) {
-    // Die with the front no matter how it goes down; an orphaned worker
-    // would hold inherited descriptors (and a pool slot's socket) forever.
-    prctl(PR_SET_PDEATHSIG, SIGKILL);
-    if (getppid() != parent) _exit(0);
-    ExecWorker(self_exe_.c_str(), socket_path.c_str(), pair[1],
-               progress_arg.c_str());
-  }
+  const pid_t parent = getpid();
+  const pid_t pid = ForkOnForker([&] {
+    const pid_t child = fork();
+    if (child == 0) {
+      // Die with the front no matter how it goes down; an orphaned worker
+      // would hold inherited descriptors (and a pool slot's socket)
+      // forever. The signal is tied to the forking thread, which is why
+      // this runs on the forker (see ForkOnForker).
+      prctl(PR_SET_PDEATHSIG, SIGKILL);
+      if (getppid() != parent) _exit(0);
+      ExecWorker(self_exe_.c_str(), socket_path.c_str(), pair[1],
+                 progress_arg.c_str());
+    }
+    return child;
+  });
   if (pair[1] >= 0) close(pair[1]);
   process.progress_fd = pair[0];
   process.pid = pid;
