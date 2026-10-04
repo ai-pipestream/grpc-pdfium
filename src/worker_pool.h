@@ -4,6 +4,8 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -104,8 +106,23 @@ class WorkerPool {
   };
 
   // Starts one worker on socket_path and waits for its socket to come up.
-  // Touches no shared state, so a respawn runs it outside the lock.
-  Process Spawn(const std::string& socket_path) const;
+  // Touches no shared state but the forker's queue, so a respawn runs it
+  // outside the lock.
+  Process Spawn(const std::string& socket_path);
+
+  // Runs fork_child on the forker thread and returns what it returned.
+  //
+  // A worker asks for SIGKILL when its parent goes (PR_SET_PDEATHSIG), and
+  // Linux sends that signal when the thread that forked it exits, not the
+  // process. A respawn runs on whichever gRPC thread released the lease, and
+  // gRPC's synchronous server retires idle threads, so a worker forked there
+  // was killed a moment after it came up and its slot failed the next call
+  // sent to it. Every fork therefore happens on one thread that lives as
+  // long as the pool.
+  pid_t ForkOnForker(const std::function<pid_t()>& fork_child);
+
+  // The forker thread's loop.
+  void Fork();
 
   // The watchdog thread's loop.
   void Watch();
@@ -119,6 +136,13 @@ class WorkerPool {
   bool stopping_ = false;
   std::vector<Worker> workers_;
   std::thread watchdog_;
+  // The forks waiting for the forker thread, and the thread itself, which
+  // starts before the first worker and stops after the last one is reaped.
+  std::mutex fork_mutex_;
+  std::condition_variable fork_cv_;
+  std::deque<std::function<void()>> fork_jobs_;
+  bool fork_stopping_ = false;
+  std::thread forker_;
 };
 
 }  // namespace grpc_pdfium

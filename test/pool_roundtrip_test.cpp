@@ -159,6 +159,20 @@ std::vector<pid_t> WorkerPids(pid_t front) {
   return pids;
 }
 
+// Whether pid is a live process rather than a zombie its parent has not
+// reaped, from /proc.
+bool Running(pid_t pid) {
+  std::ifstream stat_file("/proc/" + std::to_string(pid) + "/stat");
+  std::string stat;
+  std::getline(stat_file, stat);
+  const size_t close_paren = stat.rfind(')');
+  if (close_paren == std::string::npos) return false;
+  std::istringstream rest(stat.substr(close_paren + 1));
+  std::string state;
+  rest >> state;
+  return !state.empty() && state != "Z" && state != "X";
+}
+
 // Freezes the front's only worker, the way a document that never finishes
 // wedges one. The front's kill (SIGKILL) still ends it.
 bool FreezeWorker(pid_t front) {
@@ -900,6 +914,63 @@ int main(int argc, char** argv) {
             "the bomb's worker stays under its address-space limit");
       Check(ProbeWithin(stub.get(), fixture, std::chrono::seconds(20)).ok(),
             "the pool serves again after the bomb");
+    }
+    StopFront(&front);
+  }
+
+  // A respawned worker outlives the gRPC thread that respawned it. The
+  // worker's parent-death signal follows the thread that forked it, and the
+  // synchronous server shuts down threads it no longer needs, so a worker
+  // forked on one exited seconds after it came up and the next call routed
+  // to it failed. A decompression bomb costs one worker, which the call's
+  // own thread respawns; the pool must then keep the same live workers
+  // across calls spaced out enough for the server to shut threads down.
+  {
+    const std::string bomb = ReadSibling(argv[2], "attachment-bomb.pdf");
+    // The 1 GiB limit makes the bomb fatal on any host, as above.
+    front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "2"},
+                                 {"GRPC_PDFIUM_WORKER_MAX_BYTES", "1073741824"}});
+    if (front.port > 0 && !bomb.empty()) {
+      auto stub = Dial(front.port);
+      {
+        // Calls beside the bomb make the server start threads it shuts
+        // down once they are idle again; the bomb's respawn runs on one.
+        std::vector<std::thread> beside;
+        for (int call = 0; call < 6; ++call) {
+          beside.emplace_back([&] {
+            auto caller = Dial(front.port);
+            (void)ProbeWithin(caller.get(), fixture, std::chrono::seconds(30));
+          });
+        }
+        grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(60));
+        pdfv1::ParseRequest request;
+        request.mutable_document()->set_data(bomb);
+        request.add_families(pdfv1::PDF_FAMILY_ATTACHMENTS);
+        request.mutable_options()->set_include_attachment_data(true);
+        auto reader = stub->Parse(&ctx, request);
+        pdfv1::ParseResponse message;
+        while (reader->Read(&message)) {
+        }
+        Check(reader->Finish().error_code() == grpc::StatusCode::UNAVAILABLE,
+              "the bomb costs a worker");
+        for (std::thread& caller : beside) caller.join();
+      }
+      Check(ProbeWithin(stub.get(), fixture, std::chrono::seconds(20)).ok(),
+            "the pool serves after the bomb");
+      const std::vector<pid_t> respawned = WorkerPids(front.pid);
+      bool all_served = true;
+      for (int call = 0; call < 4; ++call) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        // A new connection per call, as independent clients make them.
+        auto caller = Dial(front.port);
+        all_served = ProbeWithin(caller.get(), fixture, std::chrono::seconds(20)).ok() && all_served;
+      }
+      Check(all_served, "calls spaced out after a respawn are served");
+      const std::vector<pid_t> later = WorkerPids(front.pid);
+      Check(respawned.size() == 2 && later == respawned &&
+                std::ranges::all_of(later, [](pid_t pid) { return Running(pid); }),
+            "the respawned worker is still the same running process seconds later");
     }
     StopFront(&front);
   }
