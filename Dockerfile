@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.27
+# syntax=docker/dockerfile:1.28
 # grpc-pdfium, published as a linux/amd64 + linux/arm64 manifest list; each
 # architecture builds and tests natively on its own runner pool.
 #
