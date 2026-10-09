@@ -11,7 +11,9 @@
 namespace grpc_pdfium {
 
 // The front-door PdfBackendService: forwards every RPC to a leased worker
-// process over its unix socket and streams the responses through. A worker
+// process over its unix socket and streams the responses through. Probe and
+// Parse lease a text worker, Render a render worker (worker_role.h says
+// why they never share a process). A worker
 // failure before any response reached the client is retried once on a fresh
 // worker; a failure mid-stream surfaces to the client as UNAVAILABLE.
 //

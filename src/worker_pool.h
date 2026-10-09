@@ -15,6 +15,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "ai/protomolt/parse/pdf/v1/pdf_backend_service.grpc.pb.h"
+#include "worker_role.h"
 
 namespace grpc_pdfium {
 
@@ -23,6 +24,13 @@ namespace grpc_pdfium {
 // rule demands: concurrency across processes, one request per process at a
 // time, and a crash on a hostile document kills one worker, not the
 // service.
+//
+// The pool is split by role (worker_role.h): text workers serve Probe and
+// Parse and never render, render workers serve Render. Rendering leaves
+// PDFium's substitute font state changed, and text extraction measured
+// after it in the same process differed from a clean one; a text worker
+// never sees a render, so its output depends only on the request. Each
+// role has its own slots and its own wait for a free one.
 //
 // A watchdog bounds every lease. A call that forwards nothing for the stall
 // limit, or that is still leased a second after its client went away, has
@@ -47,16 +55,18 @@ class WorkerPool {
 
   enum class AcquireResult { kLeased, kTimedOut, kCancelled };
 
-  // Spawns size workers running self_exe --worker <socket>. Sockets live
-  // under socket_dir. A stall_limit of zero turns the stall check off.
-  WorkerPool(std::string self_exe, std::string socket_dir, int size,
-             std::chrono::seconds stall_limit);
+  // Spawns text_size text workers and render_size render workers (each at
+  // least one) running self_exe --worker <socket> --role <role>. Sockets
+  // live under socket_dir. A stall_limit of zero turns the stall check off.
+  WorkerPool(std::string self_exe, std::string socket_dir, int text_size,
+             int render_size, std::chrono::seconds stall_limit);
   ~WorkerPool();
 
-  // Waits for a free worker until deadline, and gives up as soon as call is
+  // Waits for a free worker of role (kText or kRender) until deadline, and gives up as soon as call is
   // cancelled (its client went away or its deadline passed). From here
   // until Release the watchdog watches the lease on call's behalf.
-  AcquireResult Acquire(std::chrono::system_clock::time_point deadline,
+  AcquireResult Acquire(WorkerRole role,
+                        std::chrono::system_clock::time_point deadline,
                         grpc::ServerContext* call, Lease* lease);
 
   // Records progress on a lease (a message was forwarded), which restarts
@@ -68,13 +78,15 @@ class WorkerPool {
   // state is suspect). Returns true when the watchdog cut the lease.
   bool Release(const Lease& lease, bool failed);
 
-  int size() const { return static_cast<int>(workers_.size()); }
+  // The number of workers of role.
+  int size(WorkerRole role) const;
   std::chrono::seconds stall_limit() const { return stall_limit_; }
 
  private:
   using Stub = ai::protomolt::parse::pdf::v1::PdfBackendService::Stub;
 
   struct Worker {
+    WorkerRole role = WorkerRole::kText;
     pid_t pid = -1;
     std::string socket_path;
     std::shared_ptr<grpc::Channel> channel;
@@ -108,7 +120,7 @@ class WorkerPool {
   // Starts one worker on socket_path and waits for its socket to come up.
   // Touches no shared state but the forker's queue, so a respawn runs it
   // outside the lock.
-  Process Spawn(const std::string& socket_path);
+  Process Spawn(const std::string& socket_path, WorkerRole role);
 
   // Runs fork_child on the forker thread and returns what it returned.
   //
@@ -131,6 +143,8 @@ class WorkerPool {
   const std::string socket_dir_;
   const std::chrono::seconds stall_limit_;
   std::mutex mutex_;
+  // Waiters for both roles share it, so a freed slot wakes them all (one
+  // woken waiter could be of the other role).
   std::condition_variable available_;
   std::condition_variable stopping_cv_;
   bool stopping_ = false;

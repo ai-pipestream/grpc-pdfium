@@ -25,14 +25,16 @@ namespace {
 // progress socket pair when there is one. The front is multithreaded, so
 // only async-signal-safe calls are made here (fcntl, execl, write, _exit).
 [[noreturn]] void ExecWorker(const char* exe, const char* socket_path,
-                             int progress_fd, const char* progress_arg) {
+                             const char* role, int progress_fd,
+                             const char* progress_arg) {
   // Both ends were made close-on-exec, so a worker spawned by another
   // thread meanwhile inherits neither; this child keeps its own end.
   if (progress_fd >= 0 && fcntl(progress_fd, F_SETFD, 0) == 0) {
     execl(exe, exe, "--worker", socket_path, "--progress-fd", progress_arg,
-          static_cast<char*>(nullptr));
+          "--role", role, static_cast<char*>(nullptr));
   } else {
-    execl(exe, exe, "--worker", socket_path, static_cast<char*>(nullptr));
+    execl(exe, exe, "--worker", socket_path, "--role", role,
+          static_cast<char*>(nullptr));
   }
   // Only reached when exec fails: write(2), not stdio.
   static constexpr char kExecFailed[] = "grpc-pdfium: exec of a worker failed\n";
@@ -53,18 +55,22 @@ bool DrainProgress(int fd) {
 
 }  // namespace
 
-WorkerPool::WorkerPool(std::string self_exe, std::string socket_dir, int size,
+WorkerPool::WorkerPool(std::string self_exe, std::string socket_dir,
+                       int text_size, int render_size,
                        std::chrono::seconds stall_limit)
     : self_exe_(std::move(self_exe)),
       socket_dir_(std::move(socket_dir)),
       stall_limit_(stall_limit) {
   forker_ = std::thread([this] { Fork(); });
-  if (size < 1) size = 1;
-  workers_.resize(static_cast<size_t>(size));
-  for (int i = 0; i < size; ++i) {
+  text_size = std::max(text_size, 1);
+  render_size = std::max(render_size, 1);
+  workers_.resize(static_cast<size_t>(text_size + render_size));
+  for (int i = 0; i < text_size + render_size; ++i) {
     Worker& w = workers_[static_cast<size_t>(i)];
-    w.socket_path = socket_dir_ + "/worker-" + std::to_string(i) + ".sock";
-    Process process = Spawn(w.socket_path);
+    w.role = i < text_size ? WorkerRole::kText : WorkerRole::kRender;
+    w.socket_path = socket_dir_ + "/" + WorkerRoleName(w.role) + "-" +
+                    std::to_string(i) + ".sock";
+    Process process = Spawn(w.socket_path, w.role);
     if (process.pid < 0) {
       // The destructor does not run for a constructor that throws; stop the
       // forker here, since a joinable thread member would terminate.
@@ -131,7 +137,8 @@ pid_t WorkerPool::ForkOnForker(const std::function<pid_t()>& fork_child) {
   return pid.get();
 }
 
-WorkerPool::Process WorkerPool::Spawn(const std::string& socket_path) {
+WorkerPool::Process WorkerPool::Spawn(const std::string& socket_path,
+                                      WorkerRole role) {
   unlink(socket_path.c_str());
   Process process;
   // The worker's progress channel: pair[0] stays here, pair[1] goes to the
@@ -155,8 +162,8 @@ WorkerPool::Process WorkerPool::Spawn(const std::string& socket_path) {
       // this runs on the forker (see ForkOnForker).
       prctl(PR_SET_PDEATHSIG, SIGKILL);
       if (getppid() != parent) _exit(0);
-      ExecWorker(self_exe_.c_str(), socket_path.c_str(), pair[1],
-                 progress_arg.c_str());
+      ExecWorker(self_exe_.c_str(), socket_path.c_str(), WorkerRoleName(role),
+                 pair[1], progress_arg.c_str());
     }
     return child;
   });
@@ -186,14 +193,19 @@ WorkerPool::Process WorkerPool::Spawn(const std::string& socket_path) {
   return process;
 }
 
+int WorkerPool::size(WorkerRole role) const {
+  return static_cast<int>(std::ranges::count_if(
+      workers_, [role](const Worker& w) { return w.role == role; }));
+}
+
 WorkerPool::AcquireResult WorkerPool::Acquire(
-    std::chrono::system_clock::time_point deadline, grpc::ServerContext* call,
-    Lease* lease) {
+    WorkerRole role, std::chrono::system_clock::time_point deadline,
+    grpc::ServerContext* call, Lease* lease) {
   std::unique_lock<std::mutex> lock(mutex_);
   for (;;) {
     for (size_t i = 0; i < workers_.size(); ++i) {
       Worker& w = workers_[i];
-      if (w.busy) continue;
+      if (w.busy || w.role != role) continue;
       w.busy = true;
       w.call = call;
       // Signals left from an earlier lease are not this lease's progress.
@@ -235,7 +247,7 @@ bool WorkerPool::Release(const Lease& lease, bool failed) {
     if (!reaped) {
       w.busy = false;
       lock.unlock();
-      available_.notify_one();
+      available_.notify_all();
       return false;
     }
   }
@@ -247,13 +259,14 @@ bool WorkerPool::Release(const Lease& lease, bool failed) {
   const int progress_fd = w.progress_fd;
   w.progress_fd = -1;
   const std::string socket_path = w.socket_path;
+  const WorkerRole role = w.role;
   lock.unlock();
   if (pid > 0 && !reaped) {
     kill(pid, SIGKILL);
     waitpid(pid, nullptr, 0);
   }
   if (progress_fd >= 0) close(progress_fd);
-  Process process = Spawn(socket_path);
+  Process process = Spawn(socket_path, role);
   lock.lock();
   w.pid = process.pid;
   w.channel = std::move(process.channel);
@@ -261,7 +274,7 @@ bool WorkerPool::Release(const Lease& lease, bool failed) {
   w.progress_fd = process.progress_fd;
   w.busy = false;
   lock.unlock();
-  available_.notify_one();
+  available_.notify_all();
   return stalled;
 }
 

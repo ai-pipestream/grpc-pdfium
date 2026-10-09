@@ -38,6 +38,15 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   `GRPC_PDFIUM_CACHE_MAX_BYTES` (default 2 GiB). SHA-256 is boringssl's
   one-shot `SHA256()` (`src/sha256.*`), the TLS library gRPC already
   builds; do not add another crypto dependency.
+- The worker pool is split by role (`src/worker_role.h`): text workers
+  (`GRPC_PDFIUM_WORKERS`, default 4) serve Probe and Parse, render workers
+  (`GRPC_PDFIUM_RENDER_WORKERS`, default 2) serve Render, and a worker
+  refuses the other role's RPCs. Never route text work to a process that
+  has rendered: rendering a page whose non-embedded TrueType font PDFium
+  fits with its multiple-master substitute leaves that face changed, and
+  later char boxes in the process move (right edges by up to 0.54 pt), so
+  Parse output would depend on scheduling. Nothing on the Parse path may
+  call `FPDF_RenderPage*` either.
 - The front bounds every worker lease (`src/proxy_service_impl.cpp`,
   `src/worker_pool.*`): worker calls are made with
   `ClientContext::FromServerContext`, so the client's deadline and

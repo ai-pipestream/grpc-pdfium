@@ -18,10 +18,25 @@ type them out. Engine limits worth knowing: no XMP packet and no custom
 info keys reach the public API, so `DocMeta` fills the standard keys only.
 
 PDFium keeps process-global state and is not thread-safe, so the service
-runs as a pool of single-threaded worker processes behind a gRPC front
-(`GRPC_PDFIUM_WORKERS`, default 4). Workers speak the same contract over
-unix sockets, die with the front (`PR_SET_PDEATHSIG`), and a crash on a
-hostile document costs one worker, which is respawned.
+runs as a pool of single-threaded worker processes behind a gRPC front.
+Workers speak the same contract over unix sockets, die with the front
+(`PR_SET_PDEATHSIG`), and a crash on a hostile document costs one worker,
+which is respawned.
+
+The pool has two roles that never share a process. Text workers
+(`GRPC_PDFIUM_WORKERS`, default 4) serve `Probe` and `Parse`; render
+workers (`GRPC_PDFIUM_RENDER_WORKERS`, default 2) serve `Render`. Each
+count is at least 1, and each role has its own wait for a free worker. The
+split keeps text output deterministic: for a non-embedded TrueType font
+with `/Widths` that PDFium has no face for, it fits a built-in
+multiple-master face to the declared widths, and rendering a page left
+that shared face changed, so text cells parsed later in the same process
+came back with right edges moved by up to half a point. A text worker
+never renders (`Parse` reads embedded thumbnails and image bitmaps, which
+are decodes, not renders), so `Parse` and `Probe` answer the same for the
+same bytes whichever worker serves them. Each worker is started with
+`--role text` or `--role render` and refuses the other role's calls with
+`FAILED_PRECONDITION`.
 
 No request can hold a worker for good. A worker call inherits its client's
 deadline and cancellation, and a call the client abandons kills its worker,
