@@ -10,7 +10,8 @@
 #   2. boot: the front reaches its own "listening on" line under the
 #      hardened run flags (read-only rootfs, tmpfs /tmp for the worker
 #      sockets, no capabilities), runs as uid 65532, and its worker pool is
-#      spawned in full.
+#      spawned in full: the text workers and the render workers, each with
+#      its role on its command line.
 set -euo pipefail
 
 usage() {
@@ -21,6 +22,7 @@ usage() {
 image=$1
 binary=/usr/local/bin/grpc_pdfium
 workers=2
+render_workers=1
 container="grpc-pdfium-smoke-$$"
 
 cleanup() {
@@ -56,7 +58,8 @@ echo "== smoke: boot to listening under the hardened run flags"
 trap cleanup EXIT
 docker run -d --name "$container" \
   --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
-  -e GRPC_PDFIUM_WORKERS="$workers" "$image" >/dev/null
+  -e GRPC_PDFIUM_WORKERS="$workers" \
+  -e GRPC_PDFIUM_RENDER_WORKERS="$render_workers" "$image" >/dev/null
 wait_for_log "grpc-pdfium listening on" 60
 
 processes=$(docker top "$container" -o uid,pid,args | tail -n +2)
@@ -67,8 +70,12 @@ if [[ -n "$foreign_uid" ]]; then
   exit 1
 fi
 spawned=$(grep -c -- '--worker' <<<"$processes" || true)
-if [[ "$spawned" -ne "$workers" ]]; then
-  echo "expected $workers worker processes, found $spawned" >&2
+text=$(grep -c -- '--role text' <<<"$processes" || true)
+render=$(grep -c -- '--role render' <<<"$processes" || true)
+if [[ "$spawned" -ne $((workers + render_workers)) || "$text" -ne "$workers" ||
+      "$render" -ne "$render_workers" ]]; then
+  echo "expected $workers text and $render_workers render workers," \
+       "found $text text and $render render of $spawned" >&2
   exit 1
 fi
 

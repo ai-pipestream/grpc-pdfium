@@ -3,6 +3,11 @@
 // and check that Probe and Parse round-trip through the pool. This is the
 // process topology production runs, not an in-process shortcut.
 //
+// A front with one text worker and one render worker parses a generated
+// page set in a substituted multiple-master font, renders it, and parses it
+// again: the cells must not move, which they did while one worker served
+// both. Bare workers started per role must refuse the other role's RPCs.
+//
 // The second half exercises the content-addressed handshake
 // (PdfDocument.sha256): the byte cache lives in the front, so these checks
 // must go through the real binary. The child runs with
@@ -159,6 +164,21 @@ std::vector<pid_t> WorkerPids(pid_t front) {
   return pids;
 }
 
+// The front's worker processes of one role: those whose command line
+// carries --role <role>.
+std::vector<pid_t> WorkerPids(pid_t front, const std::string& role) {
+  std::vector<pid_t> pids;
+  for (pid_t pid : WorkerPids(front)) {
+    std::ifstream cmdline_file("/proc/" + std::to_string(pid) + "/cmdline",
+                               std::ios::binary);
+    std::ostringstream cmdline;
+    cmdline << cmdline_file.rdbuf();
+    const std::string wanted = std::string("--role") + '\0' + role + '\0';
+    if (cmdline.str().find(wanted) != std::string::npos) pids.push_back(pid);
+  }
+  return pids;
+}
+
 // Whether pid is a live process rather than a zombie its parent has not
 // reaped, from /proc.
 bool Running(pid_t pid) {
@@ -173,10 +193,11 @@ bool Running(pid_t pid) {
   return !state.empty() && state != "Z" && state != "X";
 }
 
-// Freezes the front's only worker, the way a document that never finishes
-// wedges one. The front's kill (SIGKILL) still ends it.
+// Freezes the front's only text worker (the one Probe and Parse lease), the
+// way a document that never finishes wedges one. The front's kill (SIGKILL)
+// still ends it.
 bool FreezeWorker(pid_t front) {
-  const std::vector<pid_t> workers = WorkerPids(front);
+  const std::vector<pid_t> workers = WorkerPids(front, "text");
   return workers.size() == 1 && kill(workers[0], SIGSTOP) == 0;
 }
 
@@ -258,6 +279,109 @@ grpc::Status ProbeWithin(pdfv1::PdfBackendService::Stub* stub,
   request.mutable_document()->set_data(data);
   pdfv1::ProbeResponse response;
   return stub->Probe(&ctx, request, &response);
+}
+
+// A one-page PDF whose text is set in a non-embedded TrueType font with
+// /Widths and a name PDFium has no face for, so PDFium substitutes its
+// built-in multiple-master face and fits each glyph to the declared width.
+// Rendering such a page leaves that shared face in a different state; text
+// cells measured after it in the same process came out with other right
+// edges. Built here, byte offsets and all, so the test carries no corpus
+// file.
+std::string SubstitutedFontPdf() {
+  std::string widths;
+  for (int c = 32; c <= 126; ++c) {
+    widths += std::to_string(500 + (c * 37) % 400) + " ";
+  }
+  const std::string content =
+      "BT /F1 24 Tf 72 700 Td (PIONEERS of the Bauhaus) Tj 0 -40 Td "
+      "(Substituted widths WMQ ilj) Tj ET";
+  const std::vector<std::string> objects = {
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources "
+      "<< /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+      "<< /Length " + std::to_string(content.size()) + " >>\nstream\n" +
+          content + "\nendstream",
+      "<< /Type /Font /Subtype /TrueType /BaseFont /BauhausITC-Demi "
+      "/FirstChar 32 /LastChar 126 /Widths [" + widths +
+          "] /FontDescriptor 6 0 R /Encoding /WinAnsiEncoding >>",
+      "<< /Type /FontDescriptor /FontName /BauhausITC-Demi /Flags 32 "
+      "/FontBBox [-100 -250 1100 950] /ItalicAngle 0 /Ascent 900 "
+      "/Descent -250 /CapHeight 700 /StemV 120 >>",
+  };
+  std::string pdf = "%PDF-1.4\n";
+  std::vector<size_t> offsets;
+  for (size_t i = 0; i < objects.size(); ++i) {
+    offsets.push_back(pdf.size());
+    pdf += std::to_string(i + 1) + " 0 obj\n" + objects[i] + "\nendobj\n";
+  }
+  const size_t xref = pdf.size();
+  pdf += "xref\n0 " + std::to_string(objects.size() + 1) +
+         "\n0000000000 65535 f \n";
+  for (size_t offset : offsets) {
+    char entry[32];
+    std::snprintf(entry, sizeof(entry), "%010zu 00000 n \n", offset);
+    pdf += entry;
+  }
+  pdf += "trailer\n<< /Size " + std::to_string(objects.size() + 1) +
+         " /Root 1 0 R >>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
+  return pdf;
+}
+
+// Every text cell a Parse of data returns, as text and bbox, in order.
+std::vector<std::string> TextCells(pdfv1::PdfBackendService::Stub* stub,
+                                   const std::string& data) {
+  std::vector<std::string> cells;
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(60));
+  pdfv1::ParseRequest request;
+  request.mutable_document()->set_data(data);
+  request.add_families(pdfv1::PDF_FAMILY_TEXT_CELLS);
+  auto reader = stub->Parse(&ctx, request);
+  pdfv1::ParseResponse message;
+  while (reader->Read(&message)) {
+    if (!message.has_page()) continue;
+    for (const auto& cell : message.page().text_cells()) {
+      char box[160];
+      std::snprintf(box, sizeof(box), " [%.4f %.4f %.4f %.4f]", cell.bbox().x0(),
+                    cell.bbox().y0(), cell.bbox().x1(), cell.bbox().y1());
+      cells.push_back(cell.text() + box);
+    }
+  }
+  if (!reader->Finish().ok()) cells.push_back("<parse failed>");
+  return cells;
+}
+
+// Renders every page of the document (by hash alone when data is empty) and
+// counts the rasters.
+int RenderPages(pdfv1::PdfBackendService::Stub* stub, const std::string& data,
+                const std::string& sha, double dpi) {
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(60));
+  pdfv1::RenderRequest request;
+  request.mutable_document()->set_data(data);
+  if (!sha.empty()) request.mutable_document()->set_sha256(sha);
+  request.set_dpi(dpi);
+  auto reader = stub->Render(&ctx, request);
+  pdfv1::RenderResponse message;
+  int rasters = 0;
+  while (reader->Read(&message)) rasters += message.has_raster() ? 1 : 0;
+  return reader->Finish().ok() ? rasters : -1;
+}
+
+// Starts a bare worker of role on socket_path, the way the pool does, and
+// waits for its socket.
+pid_t StartWorker(const char* binary, const std::string& socket_path,
+                  const char* role) {
+  unlink(socket_path.c_str());
+  const pid_t pid = fork();
+  if (pid == 0) {
+    execl(binary, binary, "--worker", socket_path.c_str(), "--role", role,
+          static_cast<char*>(nullptr));
+    _exit(127);
+  }
+  return pid;
 }
 
 }  // namespace
@@ -641,6 +765,106 @@ int main(int argc, char** argv) {
 
   StopFront(&front);
 
+  // Text work and rendering run on separate workers. PDFium substitutes a
+  // multiple-master face for a non-embedded TrueType font with /Widths, and
+  // rendering a page in it left the face changed: a Parse after a Render on
+  // the same worker returned other right edges for the same cells, so the
+  // output depended on which worker served it and what it had rendered.
+  // With one worker of each role every call lands on the same two
+  // processes, and the cells must not move.
+  front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "1"},
+                               {"GRPC_PDFIUM_RENDER_WORKERS", "1"}});
+  if (front.port > 0) {
+    Check(WorkerPids(front.pid, "text").size() == 1 &&
+              WorkerPids(front.pid, "render").size() == 1 &&
+              WorkerPids(front.pid).size() == 2,
+          "the pool runs one text worker and one render worker");
+    auto stub = Dial(front.port);
+    const std::string substituted = SubstitutedFontPdf();
+    const std::vector<std::string> before = TextCells(stub.get(), substituted);
+    Check(before.size() == 8, "the substituted-font page parses into 8 cells");
+    Check(RenderPages(stub.get(), substituted, "", 72.0) == 1,
+          "the substituted-font page renders");
+    const std::vector<std::string> after = TextCells(stub.get(), substituted);
+    Check(after == before,
+          "text cells are identical after the same document was rendered");
+    if (after != before) {
+      for (size_t i = 0; i < std::max(before.size(), after.size()); ++i) {
+        std::fprintf(stderr, "  before: %s\n  after:  %s\n",
+                     i < before.size() ? before[i].c_str() : "-",
+                     i < after.size() ? after[i].c_str() : "-");
+      }
+    }
+    // The byte cache is the front's, so a Render by hash finds the bytes a
+    // Parse uploaded although a different worker serves it.
+    {
+      grpc::ClientContext ctx;
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(fixture);
+      request.mutable_document()->set_sha256(grpc_pdfium::Sha256Hex(fixture));
+      request.add_families(pdfv1::PDF_FAMILY_TEXT_CELLS);
+      auto reader = stub->Parse(&ctx, request);
+      pdfv1::ParseResponse message;
+      while (reader->Read(&message)) {
+      }
+      Check(reader->Finish().ok(), "Parse with bytes and hash caches them");
+    }
+    Check(RenderPages(stub.get(), "", grpc_pdfium::Sha256Hex(fixture), 72.0) == 1,
+          "a Render by hash alone is served from the bytes a Parse cached");
+  }
+  StopFront(&front);
+
+  // A worker refuses the other role's RPCs, so a text worker cannot render
+  // even when dialed directly.
+  {
+    char dir_template[] = "/tmp/grpc-pdfium-role-XXXXXX";
+    const char* dir = mkdtemp(dir_template);
+    Check(dir != nullptr, "worker socket directory created");
+    if (dir != nullptr) {
+      const std::string text_socket = std::string(dir) + "/text.sock";
+      const std::string render_socket = std::string(dir) + "/render.sock";
+      const pid_t text_pid = StartWorker(argv[1], text_socket, "text");
+      const pid_t render_pid = StartWorker(argv[1], render_socket, "render");
+      auto text_channel = grpc::CreateChannel("unix://" + text_socket,
+                                              grpc::InsecureChannelCredentials());
+      auto render_channel = grpc::CreateChannel(
+          "unix://" + render_socket, grpc::InsecureChannelCredentials());
+      const auto up_by = std::chrono::system_clock::now() + std::chrono::seconds(15);
+      Check(text_channel->WaitForConnected(up_by) &&
+                render_channel->WaitForConnected(up_by),
+            "bare text and render workers come up");
+      auto text_stub = pdfv1::PdfBackendService::NewStub(text_channel);
+      auto render_stub = pdfv1::PdfBackendService::NewStub(render_channel);
+      {
+        grpc::ClientContext ctx;
+        pdfv1::RenderRequest request;
+        request.mutable_document()->set_data(fixture);
+        request.set_dpi(72.0);
+        auto reader = text_stub->Render(&ctx, request);
+        pdfv1::RenderResponse message;
+        bool rastered = false;
+        while (reader->Read(&message)) rastered = rastered || message.has_raster();
+        Check(!rastered && reader->Finish().error_code() ==
+                               grpc::StatusCode::FAILED_PRECONDITION,
+              "a text worker refuses Render");
+      }
+      Check(TextCells(text_stub.get(), fixture).size() > 0,
+            "a text worker serves Parse");
+      Check(TextCells(render_stub.get(), fixture) ==
+                std::vector<std::string>{"<parse failed>"},
+            "a render worker refuses Parse");
+      Check(RenderPages(render_stub.get(), fixture, "", 72.0) == 1,
+            "a render worker serves Render");
+      for (pid_t pid : {text_pid, render_pid}) {
+        kill(pid, SIGTERM);
+        waitpid(pid, nullptr, 0);
+      }
+      unlink(text_socket.c_str());
+      unlink(render_socket.c_str());
+      rmdir(dir);
+    }
+  }
+
   using std::chrono::milliseconds;
   using std::chrono::seconds;
 
@@ -884,8 +1108,8 @@ int main(int argc, char** argv) {
       // it goes.
       std::atomic<bool> done{false};
       long peak_kib = 0;
-      const std::vector<pid_t> workers = WorkerPids(front.pid);
-      Check(workers.size() == 1, "bomb front has one worker");
+      const std::vector<pid_t> workers = WorkerPids(front.pid, "text");
+      Check(workers.size() == 1, "bomb front has one text worker");
       std::thread sampler([&] {
         while (!done.load()) {
           for (pid_t pid : workers) peak_kib = std::max(peak_kib, PeakRssKib(pid));
@@ -958,7 +1182,7 @@ int main(int argc, char** argv) {
       }
       Check(ProbeWithin(stub.get(), fixture, std::chrono::seconds(20)).ok(),
             "the pool serves after the bomb");
-      const std::vector<pid_t> respawned = WorkerPids(front.pid);
+      const std::vector<pid_t> respawned = WorkerPids(front.pid, "text");
       bool all_served = true;
       for (int call = 0; call < 4; ++call) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -967,7 +1191,7 @@ int main(int argc, char** argv) {
         all_served = ProbeWithin(caller.get(), fixture, std::chrono::seconds(20)).ok() && all_served;
       }
       Check(all_served, "calls spaced out after a respawn are served");
-      const std::vector<pid_t> later = WorkerPids(front.pid);
+      const std::vector<pid_t> later = WorkerPids(front.pid, "text");
       Check(respawned.size() == 2 && later == respawned &&
                 std::ranges::all_of(later, [](pid_t pid) { return Running(pid); }),
             "the respawned worker is still the same running process seconds later");

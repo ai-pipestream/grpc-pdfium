@@ -1,6 +1,7 @@
 #include "pdf_backend_service_impl.h"
 
 #include <mutex>
+#include <string>
 
 #include "pdfium_engine.h"
 #include "request_checks.h"
@@ -21,11 +22,18 @@ std::mutex& EngineMutex() {
   return m;
 }
 
+grpc::Status WrongRole(WorkerRole role, const char* rpc) {
+  return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                      std::string("this is a ") + WorkerRoleName(role) +
+                          " worker and does not serve " + rpc);
+}
+
 }  // namespace
 
 grpc::Status PdfBackendServiceImpl::Probe(grpc::ServerContext* /*context*/,
                                           const pdfv1::ProbeRequest* request,
                                           pdfv1::ProbeResponse* response) {
+  if (!ServesText(role_)) return WrongRole(role_, "Probe");
   std::lock_guard<std::mutex> lock(EngineMutex());
   PdfiumEngine::InitProcess();
   PdfiumEngine::Probe(request->document(), response->mutable_capabilities());
@@ -35,6 +43,7 @@ grpc::Status PdfBackendServiceImpl::Probe(grpc::ServerContext* /*context*/,
 grpc::Status PdfBackendServiceImpl::Parse(
     grpc::ServerContext* /*context*/, const pdfv1::ParseRequest* request,
     grpc::ServerWriter<pdfv1::ParseResponse>* writer) {
+  if (!ServesText(role_)) return WrongRole(role_, "Parse");
   grpc::Status checked = CheckParseRequest(*request);
   if (!checked.ok()) return checked;
   std::lock_guard<std::mutex> lock(EngineMutex());
@@ -48,6 +57,7 @@ grpc::Status PdfBackendServiceImpl::Parse(
 grpc::Status PdfBackendServiceImpl::Render(
     grpc::ServerContext* /*context*/, const pdfv1::RenderRequest* request,
     grpc::ServerWriter<pdfv1::RenderResponse>* writer) {
+  if (!ServesRender(role_)) return WrongRole(role_, "Render");
   grpc::Status checked = CheckRenderRequest(*request);
   if (!checked.ok()) return checked;
   std::lock_guard<std::mutex> lock(EngineMutex());

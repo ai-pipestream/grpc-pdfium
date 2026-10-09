@@ -107,27 +107,29 @@ void FillVerdictCapabilities(pdfv1::BackendCapabilities* caps,
   caps->set_load_detail(detail);
 }
 
-// One forwarded call's view of the pool: the client call it serves and how
-// long it may wait for a free worker.
+// One forwarded call's view of the pool: the role of worker it needs, the
+// client call it serves, and how long it may wait for a free worker.
 struct Forwarding {
   WorkerPool* pool;
+  WorkerRole role;
   grpc::ServerContext* context;
   std::chrono::system_clock::time_point queue_deadline;
 };
 
 // A request waits for a free worker as long as its client does, and no
 // longer than queue_limit when one is set.
-Forwarding StartForwarding(WorkerPool* pool, grpc::ServerContext* context,
+Forwarding StartForwarding(WorkerPool* pool, WorkerRole role,
+                           grpc::ServerContext* context,
                            std::chrono::seconds queue_limit) {
   std::chrono::system_clock::time_point deadline = context->deadline();
   if (queue_limit.count() > 0) {
     deadline = std::min(deadline, std::chrono::system_clock::now() + queue_limit);
   }
-  return Forwarding{pool, context, deadline};
+  return Forwarding{pool, role, context, deadline};
 }
 
 grpc::Status AcquireWorker(const Forwarding& fwd, WorkerPool::Lease* lease) {
-  switch (fwd.pool->Acquire(fwd.queue_deadline, fwd.context, lease)) {
+  switch (fwd.pool->Acquire(fwd.role, fwd.queue_deadline, fwd.context, lease)) {
     case WorkerPool::AcquireResult::kLeased:
       return grpc::Status::OK;
     case WorkerPool::AcquireResult::kCancelled:
@@ -136,7 +138,8 @@ grpc::Status AcquireWorker(const Forwarding& fwd, WorkerPool::Lease* lease) {
       break;
   }
   return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
-                      "all " + std::to_string(fwd.pool->size()) +
+                      "all " + std::to_string(fwd.pool->size(fwd.role)) + " " +
+                          WorkerRoleName(fwd.role) +
                           " workers stayed busy for the whole wait");
 }
 
@@ -246,7 +249,8 @@ grpc::Status ProxyServiceImpl::Probe(grpc::ServerContext* context,
   }
   WorkerRequest<pdfv1::ProbeRequest> forwarded(*request,
                                                std::move(resolved.cached));
-  const Forwarding fwd = StartForwarding(pool_, context, queue_limit_);
+  const Forwarding fwd =
+      StartForwarding(pool_, WorkerRole::kText, context, queue_limit_);
   Settled settled;
   for (int attempt = 0; attempt < 2; ++attempt) {
     WorkerPool::Lease lease;
@@ -288,8 +292,10 @@ grpc::Status ProxyServiceImpl::Parse(grpc::ServerContext* context,
   }
   WorkerRequest<pdfv1::ParseRequest> forwarded(*request,
                                                std::move(resolved.cached));
+  // Text work never shares a process with rendering (worker_role.h).
   return ForwardStreaming(
-      StartForwarding(pool_, context, queue_limit_), &forwarded, writer,
+      StartForwarding(pool_, WorkerRole::kText, context, queue_limit_),
+      &forwarded, writer,
       [](pdfv1::PdfBackendService::Stub* stub, grpc::ClientContext* ctx,
          const pdfv1::ParseRequest& req) { return stub->Parse(ctx, req); });
 }
@@ -319,7 +325,8 @@ grpc::Status ProxyServiceImpl::Render(grpc::ServerContext* context,
   WorkerRequest<pdfv1::RenderRequest> forwarded(*request,
                                                 std::move(resolved.cached));
   return ForwardStreaming(
-      StartForwarding(pool_, context, queue_limit_), &forwarded, writer,
+      StartForwarding(pool_, WorkerRole::kRender, context, queue_limit_),
+      &forwarded, writer,
       [](pdfv1::PdfBackendService::Stub* stub, grpc::ClientContext* ctx,
          const pdfv1::RenderRequest& req) { return stub->Render(ctx, req); });
 }

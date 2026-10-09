@@ -2,6 +2,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -21,6 +22,7 @@
 #include "pdfium_engine.h"
 #include "proxy_service_impl.h"
 #include "worker_pool.h"
+#include "worker_role.h"
 
 namespace {
 
@@ -123,8 +125,9 @@ int ProgressFdFromArg(const char* arg) {
 }
 
 // progress_fd is the worker's end of the front's progress socket pair, or
-// -1 when the front could not make one.
-int RunWorker(const std::string& socket_path, int progress_fd) {
+// -1 when the front could not make one. role is what the worker serves.
+int RunWorker(const std::string& socket_path, int progress_fd,
+              grpc_pdfium::WorkerRole role) {
   uint64_t max_bytes = 0;
   if (!WorkerMaxBytesFromEnv(&max_bytes) || !LimitWorkerMemory(max_bytes)) {
     return 1;
@@ -134,7 +137,7 @@ int RunWorker(const std::string& socket_path, int progress_fd) {
     grpc_pdfium::PdfiumEngine::SetProgressHook(
         [progress_fd] { SignalProgress(progress_fd); });
   }
-  grpc_pdfium::PdfBackendServiceImpl service;
+  grpc_pdfium::PdfBackendServiceImpl service(role);
   grpc::ServerBuilder builder;
   builder.SetMaxReceiveMessageSize(kMaxMessageBytes);
   builder.SetMaxSendMessageSize(kMaxMessageBytes);
@@ -189,9 +192,15 @@ int RunFront() {
   const std::string address =
       std::string("0.0.0.0:") + (port_env != nullptr ? port_env : "50069");
 
-  int pool_size = 4;
+  // Text workers serve Probe and Parse, render workers serve Render; the
+  // two never share a process (worker_role.h). Each is at least one.
+  int text_workers = 4;
   if (const char* workers_env = std::getenv("GRPC_PDFIUM_WORKERS")) {
-    pool_size = std::max(1, std::atoi(workers_env));
+    text_workers = std::max(1, std::atoi(workers_env));
+  }
+  int render_workers = 2;
+  if (const char* workers_env = std::getenv("GRPC_PDFIUM_RENDER_WORKERS")) {
+    render_workers = std::max(1, std::atoi(workers_env));
   }
 
   // The content-addressed byte cache bounds: how many documents, and their
@@ -230,8 +239,8 @@ int RunFront() {
   grpc::EnableDefaultHealthCheckService(true);
   grpc::reflection::InitProtoReflectionServerBuilderPlugin();
 
-  grpc_pdfium::WorkerPool pool(SelfExe(), socket_dir, pool_size,
-                               *request_timeout);
+  grpc_pdfium::WorkerPool pool(SelfExe(), socket_dir, text_workers,
+                               render_workers, *request_timeout);
   grpc_pdfium::ByteCache byte_cache(cache_max_documents, cache_max_bytes);
   grpc_pdfium::ProxyServiceImpl service(&pool, &byte_cache, *queue_timeout);
   grpc::ServerBuilder builder;
@@ -250,23 +259,49 @@ int RunFront() {
   // GRPC_PDFIUM_PORT=0 asks for an ephemeral port; the printed address is
   // the bound one either way, and tests parse it from this line.
   std::cout << "grpc-pdfium listening on 0.0.0.0:" << selected_port << " ("
-            << grpc_pdfium::PdfiumEngine::EngineVersion() << ", " << pool_size
-            << " workers)" << std::endl;
+            << grpc_pdfium::PdfiumEngine::EngineVersion() << ", "
+            << text_workers << " text workers, " << render_workers
+            << " render workers)" << std::endl;
   server->Wait();
   return 0;
+}
+
+// A worker's command line: --worker <socket> [--progress-fd <fd>]
+// [--role text|render|any]. Without --role a worker serves every RPC.
+int WorkerMain(int argc, char** argv) {
+  int progress_fd = -1;
+  grpc_pdfium::WorkerRole role = grpc_pdfium::WorkerRole::kAny;
+  for (int i = 3; i < argc; i += 2) {
+    const std::string option = argv[i];
+    if (i + 1 >= argc) {
+      std::cerr << option << " needs a value" << std::endl;
+      return 1;
+    }
+    if (option == "--progress-fd") {
+      progress_fd = ProgressFdFromArg(argv[i + 1]);
+      if (progress_fd < 0) return 1;
+    } else if (option == "--role") {
+      const std::optional<grpc_pdfium::WorkerRole> named =
+          grpc_pdfium::ParseWorkerRole(argv[i + 1]);
+      if (!named) {
+        std::cerr << "--role is not text, render or any: " << argv[i + 1]
+                  << std::endl;
+        return 1;
+      }
+      role = *named;
+    } else {
+      std::cerr << "unknown worker option: " << option << std::endl;
+      return 1;
+    }
+  }
+  return RunWorker(argv[2], progress_fd, role);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc == 3 && std::string(argv[1]) == "--worker") {
-    return RunWorker(argv[2], -1);
-  }
-  if (argc == 5 && std::string(argv[1]) == "--worker" &&
-      std::string(argv[3]) == "--progress-fd") {
-    const int progress_fd = ProgressFdFromArg(argv[4]);
-    if (progress_fd < 0) return 1;
-    return RunWorker(argv[2], progress_fd);
+  if (argc >= 3 && std::string(argv[1]) == "--worker") {
+    return WorkerMain(argc, argv);
   }
   return RunFront();
 }
