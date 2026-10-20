@@ -2,8 +2,9 @@ name: Publish Images
 
 # Builds the service image (the build stage runs the test suite), boot-proofs
 # the runtime stage with scripts/smoke-test.sh, and only then names it on
-# docker.io/pipestreamai. Every push to main republishes :latest; a manual
-# dispatch with a version input also tags that version and stamps it as the
+# docker.io/pipestreamai. Every push to main republishes :latest. A push of
+# a v* tag (v0.3.0 publishes :0.3.0) or a manual dispatch with a version
+# input also tags that version beside :latest and stamps it as the
 # build_version GetServiceInfo reports. Docker Hub credentials come from the
 # DOCKER_USER / DOCKER_TOKEN org secrets.
 #
@@ -26,6 +27,7 @@ name: Publish Images
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       version:
@@ -45,23 +47,33 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       # Empty on a plain main push: only :latest is republished.
-      version: ${{ inputs.version }}
+      version: ${{ steps.resolve.outputs.version }}
       # Always set: stamped into GetServiceInfo as build_version.
       build_version: ${{ steps.resolve.outputs.build_version }}
     steps:
-      - name: Resolve the build version stamp
+      - name: Resolve the version and the build version stamp
         id: resolve
+        shell: bash
         env:
-          VERSION: ${{ inputs.version }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [ -n "$VERSION" ]; then
-            version="$VERSION"
-          else
-            version="latest"
+          case "$GITHUB_REF" in
+            refs/tags/v*) version="${GITHUB_REF_NAME#v}" ;;
+            *) version="${INPUT_VERSION:-}" ;;
+          esac
+          if [ -n "$version" ] && ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z][0-9A-Za-z.-]{0,63})?$ ]]; then
+            echo "::error::version '$version' is not a semantic version such as 0.3.0"
+            exit 1
           fi
-          echo "build_version=$version" >> "$GITHUB_OUTPUT"
-          echo "publishing '${VERSION:-<latest only>}' with build_version $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ -n "$version" ]; then
+            build_version="$version"
+          else
+            build_version="latest"
+          fi
+          echo "build_version=$build_version" >> "$GITHUB_OUTPUT"
+          echo "publishing '${version:-<latest only>}' with build_version $build_version"
 
   build:
     name: Build ${{ matrix.platform }}
