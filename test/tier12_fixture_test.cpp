@@ -7,6 +7,9 @@
 // font-names.pdf font names that are not valid UTF-8, and byte-strings.pdf
 // link and outline URIs and signature fields that are not valid UTF-8.
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -43,6 +46,68 @@ std::string ReadFile(const std::string& path) {
   std::ostringstream buf;
   buf << in.rdbuf();
   return buf.str();
+}
+
+// Writes numbered objects into a PDF with a classic cross-reference table.
+std::string AssemblePdf(const std::vector<std::string>& objects) {
+  std::string out = "%PDF-1.7\n";
+  std::vector<size_t> offsets;
+  for (size_t i = 0; i < objects.size(); ++i) {
+    offsets.push_back(out.size());
+    out += std::to_string(i + 1) + " 0 obj\n" + objects[i] + "\nendobj\n";
+  }
+  const size_t xref = out.size();
+  out += "xref\n0 " + std::to_string(objects.size() + 1) +
+         "\n0000000000 65535 f \n";
+  for (size_t offset : offsets) {
+    char line[32];
+    std::snprintf(line, sizeof(line), "%010zu 00000 n \n", offset);
+    out += line;
+  }
+  out += "trailer\n<< /Size " + std::to_string(objects.size() + 1) +
+         " /Root 1 0 R >>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
+  return out;
+}
+
+// One blank page and an outline whose sibling chain is a loop: item A's
+// /Next is B and B's /Next is A again, and A's /First is A itself. A
+// walker that follows /Next and /First without remembering what it has
+// seen never finishes.
+std::string OutlineCyclePdf() {
+  return AssemblePdf({
+      "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+      "<< /Type /Outlines /First 5 0 R /Last 6 0 R /Count 2 >>",
+      "<< /Title (A) /Parent 4 0 R /Next 6 0 R /First 5 0 R /Last 5 0 R "
+      "/Count 1 >>",
+      "<< /Title (B) /Parent 4 0 R /Prev 5 0 R /Next 5 0 R >>",
+  });
+}
+
+// Parses the outline of pdf in a child process and reports how many roots
+// it produced, or -1 when the child did not finish within the limit. The
+// child runs the engine directly, before this process starts a server, so
+// a walk that never ends costs the child alone: its alarm ends it.
+int OutlineRootsInChild(const std::string& pdf, unsigned limit_seconds) {
+  const pid_t child = fork();
+  if (child == 0) {
+    alarm(limit_seconds);
+    grpc_pdfium::PdfiumEngine::InitProcess();
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_data(pdf);
+    request.add_families(pdfv1::PDF_FAMILY_OUTLINE);
+    int roots = 0;
+    grpc_pdfium::PdfiumEngine::Parse(request, [&roots](const pdfv1::ParseResponse& msg) {
+      if (msg.has_outline()) roots = msg.outline().roots_size();
+      return true;
+    });
+    _exit(roots >= 0 && roots < 100 ? roots : 100);
+  }
+  if (child < 0) return -1;
+  int status = 0;
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
+  return WEXITSTATUS(status);
 }
 
 pdfv1::FamilySupport SupportOf(const pdfv1::BackendCapabilities& caps,
@@ -150,6 +215,16 @@ int main(int argc, char** argv) {
             !enc_locked.empty() && !page_tree.empty() && !form_xobject.empty() &&
             !huge_image.empty() && !font_names.empty() && !byte_strings.empty(),
         "fixtures read");
+
+  // An outline whose /Next chain loops (A -> B -> A) and whose item A
+  // names itself as its own /First: the walk visits each item once, so the
+  // outline comes back with its two roots and nothing under A, instead of
+  // growing until the process runs out of memory. Run before the server
+  // starts, in a child the alarm cuts short.
+  {
+    const int roots = OutlineRootsInChild(OutlineCyclePdf(), 20);
+    Check(roots == 2, "an outline with a sibling loop lists each item once");
+  }
 
   // ValidUtf8: well-formed UTF-8 passes through; each byte of an
   // ill-formed sequence (a GBK name, a truncated sequence, an overlong
