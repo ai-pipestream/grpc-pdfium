@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <set>
+#include <vector>
 
 #include "fpdf_annot.h"
 #include "fpdf_attachment.h"
@@ -239,8 +241,27 @@ void FillEncryption(FPDF_DOCUMENT doc, pdfv1::EncryptionInfo* enc) {
   enc->set_can_print_high_res(perms & (1u << 11));
 }
 
+// The outline items a walk has reached. PDFium hands back one dictionary
+// object per outline item, so the handle names the item: a /First or /Next
+// that leads to an item already here is a loop, and the walk stops there.
+using SeenBookmarks = std::set<FPDF_BOOKMARK>;
+
+// The children of parent (the root items when parent is null), each one
+// not seen before; the chain ends at the first item seen already.
+std::vector<FPDF_BOOKMARK> UnseenChildren(FPDF_DOCUMENT doc,
+                                          FPDF_BOOKMARK parent,
+                                          SeenBookmarks* seen) {
+  std::vector<FPDF_BOOKMARK> children;
+  for (FPDF_BOOKMARK child = FPDFBookmark_GetFirstChild(doc, parent);
+       child != nullptr && seen->insert(child).second;
+       child = FPDFBookmark_GetNextSibling(doc, child)) {
+    children.push_back(child);
+  }
+  return children;
+}
+
 void FillOutline(FPDF_DOCUMENT doc, FPDF_BOOKMARK bookmark,
-                 pdfv1::OutlineNode* node, int depth) {
+                 pdfv1::OutlineNode* node, int depth, SeenBookmarks* seen) {
   node->set_title(Utf16Field([bookmark](void* buf, unsigned long len) {
     return FPDFBookmark_GetTitle(bookmark, buf, len);
   }));
@@ -260,11 +281,11 @@ void FillOutline(FPDF_DOCUMENT doc, FPDF_BOOKMARK bookmark,
       }
     }
   }
-  // Malformed outlines can cycle; a depth cap keeps the walk finite.
+  // Each item is visited once (seen), which ends a /First or /Next loop;
+  // the depth cap bounds a chain that is merely deep.
   if (depth >= 64) return;
-  for (FPDF_BOOKMARK child = FPDFBookmark_GetFirstChild(doc, bookmark);
-       child != nullptr; child = FPDFBookmark_GetNextSibling(doc, child)) {
-    FillOutline(doc, child, node->add_children(), depth + 1);
+  for (FPDF_BOOKMARK child : UnseenChildren(doc, bookmark, seen)) {
+    FillOutline(doc, child, node->add_children(), depth + 1, seen);
   }
 }
 
@@ -1068,10 +1089,9 @@ bool EmitDocLevelFamilies(
   if (facts.has_outline && WantFamily(request, pdfv1::PDF_FAMILY_OUTLINE)) {
     pdfv1::ParseResponse msg;
     auto* chunk = msg.mutable_outline();
-    for (FPDF_BOOKMARK bookmark = FPDFBookmark_GetFirstChild(doc, nullptr);
-         bookmark != nullptr;
-         bookmark = FPDFBookmark_GetNextSibling(doc, bookmark)) {
-      FillOutline(doc, bookmark, chunk->add_roots(), 0);
+    SeenBookmarks seen;
+    for (FPDF_BOOKMARK bookmark : UnseenChildren(doc, nullptr, &seen)) {
+      FillOutline(doc, bookmark, chunk->add_roots(), 0, &seen);
     }
     ShiftToCropSpace(origins, chunk);
     if (!emit(msg)) return false;
