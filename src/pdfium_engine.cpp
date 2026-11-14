@@ -349,7 +349,7 @@ void FillInventory(FPDF_DOCUMENT doc, const pdfv1::PdfDocument& document,
 
 // Whitespace as the word splitter: ASCII space controls plus the common
 // Unicode space code points the text page emits.
-bool IsWordBreak(unsigned short unit) {
+bool IsWordBreak(unsigned int unit) {
   if (unit <= 0x20) return true;
   if (unit == 0xA0) return true;
   if (unit >= 0x2000 && unit <= 0x200B) return true;
@@ -368,25 +368,36 @@ void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
   FPDF_TEXTPAGE text_page = FPDFText_LoadPage(page);
   if (text_page == nullptr) return;
   const int char_count = FPDFText_CountChars(text_page);
-  std::vector<unsigned short> units;
-  if (char_count > 0) {
-    units.resize(static_cast<size_t>(char_count) + 1);
-    FPDFText_GetText(text_page, 0, char_count, units.data());
-    units.resize(static_cast<size_t>(char_count));
+  // One code point per character index, read with GetUnicode. GetText
+  // drops or folds characters with no text (control-code glyphs that figures
+  // converted from EPS draw by the hundred), so its string runs shorter than
+  // the character count and every later word would take the boxes, font and
+  // text object of characters further back.
+  std::vector<unsigned int> codes(static_cast<size_t>(std::max(char_count, 0)));
+  for (int i = 0; i < char_count; ++i) {
+    codes[static_cast<size_t>(i)] = FPDFText_GetUnicode(text_page, i);
   }
 
   int start = -1;
   for (int i = 0; i <= char_count; ++i) {
-    const bool boundary =
-        i == char_count || IsWordBreak(units[static_cast<size_t>(i)]);
+    const bool boundary = i == char_count || IsWordBreak(codes[static_cast<size_t>(i)]);
     if (!boundary) {
       if (start < 0) start = i;
       continue;
     }
     if (start < 0) continue;
     const int count = i - start;
-    std::vector<unsigned short> word(units.begin() + start,
-                                     units.begin() + i);
+    std::vector<unsigned short> word;
+    word.reserve(static_cast<size_t>(count));
+    for (int c = start; c < i; ++c) {
+      const unsigned int code = codes[static_cast<size_t>(c)];
+      if (code > 0xFFFF && code <= 0x10FFFF) {
+        word.push_back(static_cast<unsigned short>(0xD800 + ((code - 0x10000) >> 10)));
+        word.push_back(static_cast<unsigned short>(0xDC00 + ((code - 0x10000) & 0x3FF)));
+      } else {
+        word.push_back(static_cast<unsigned short>(code));
+      }
+    }
 
     double x0 = 0;
     double y0 = 0;

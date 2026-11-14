@@ -146,9 +146,10 @@ int main(int argc, char** argv) {
   const std::string huge_image = ReadFile(dir + "/huge-image.pdf");
   const std::string font_names = ReadFile(dir + "/font-names.pdf");
   const std::string byte_strings = ReadFile(dir + "/byte-strings.pdf");
+  const std::string control_glyphs = ReadFile(dir + "/control-glyphs.pdf");
   Check(!rich.empty() && !signed_doc.empty() && !enc_open.empty() &&
             !enc_locked.empty() && !page_tree.empty() && !form_xobject.empty() &&
-            !huge_image.empty() && !font_names.empty() && !byte_strings.empty(),
+            !huge_image.empty() && !font_names.empty() && !byte_strings.empty() && !control_glyphs.empty(),
         "fixtures read");
 
   // ValidUtf8: well-formed UTF-8 passes through; each byte of an
@@ -844,6 +845,26 @@ int main(int argc, char** argv) {
               trailer.warnings(0).page_index() == 0 &&
               trailer.warnings(0).family() == pdfv1::PDF_FAMILY_PLACED_IMAGES,
           "the trailer warns about the left-out image data");
+  }
+
+  // control-glyphs.pdf: GetText leaves out some of the control-code glyphs
+  // drawn above the caption, so its string is shorter than the character
+  // count. Each cell is read per character index: "Round-wise" keeps its
+  // own box at y 500, not one up among the glyphs at y 600.
+  {
+    ParsedStream s = ParseAll(stub.get(), control_glyphs, false);
+    const pdfv1::TextCell* word = nullptr;
+    for (const auto& cell : s.page.text_cells()) {
+      if (cell.text() == "Round-wise") word = &cell;
+    }
+    Check(word != nullptr, "control-glyphs: the caption word is a cell");
+    if (word != nullptr) {
+      const double low = std::min(word->bbox().y0(), word->bbox().y1());
+      const double high = std::max(word->bbox().y0(), word->bbox().y1());
+      Check(low > 490 && high < 520, "control-glyphs: the caption word keeps its own box");
+      Check(word->font_size() > 9.5 && word->font_size() < 10.5,
+            "control-glyphs: the caption word keeps its own font size");
+    }
   }
 
   // signed.pdf: the signature family delivers what is stored.
