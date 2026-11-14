@@ -865,6 +865,11 @@ int main(int argc, char** argv) {
       Check(word->font_size() > 9.5 && word->font_size() < 10.5,
             "control-glyphs: the caption word keeps its own font size");
     }
+    bool hyphenated = false;
+    for (const auto& cell : s.page.text_cells()) {
+      if (cell.text() == "selec\xEF\xBF\xBEtion") hyphenated = true;
+    }
+    Check(hyphenated, "control-glyphs: a line-break hyphen stays U+FFFE inside one cell");
   }
 
   // signed.pdf: the signature family delivers what is stored.

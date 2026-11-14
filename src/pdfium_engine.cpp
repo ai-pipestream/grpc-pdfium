@@ -374,8 +374,13 @@ void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
   // the character count and every later word would take the boxes, font and
   // text object of characters further back.
   std::vector<unsigned int> codes(static_cast<size_t>(std::max(char_count, 0)));
+  // A hyphen pdfium took for a line break reads 0x02 here; GetText writes
+  // it as U+FFFE inside the word, and so does this, so "selec-" / "tion"
+  // stays one cell that consumers join.
   for (int i = 0; i < char_count; ++i) {
-    codes[static_cast<size_t>(i)] = FPDFText_GetUnicode(text_page, i);
+    const unsigned int code = FPDFText_GetUnicode(text_page, i);
+    codes[static_cast<size_t>(i)] =
+        code == 0x02 || FPDFText_IsHyphen(text_page, i) == 1 ? 0xFFFE : code;
   }
 
   int start = -1;
