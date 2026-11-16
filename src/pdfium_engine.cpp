@@ -20,6 +20,7 @@
 #include "page_space.h"
 #include "glyph_recovery.h"
 #include "pdfium_tier12.h"
+#include "word_breaks.h"
 
 namespace grpc_pdfium {
 
@@ -357,6 +358,19 @@ bool IsWordBreak(unsigned int unit) {
   return unit == 0x2028 || unit == 0x2029 || unit == 0x3000 || unit == 0xFEFF;
 }
 
+// Size and baseline origin per character index, for ScriptShiftBreak.
+std::vector<CharPlacement> ReadPlacements(FPDF_TEXTPAGE text_page, int char_count,
+                                          const std::vector<unsigned int>& codes) {
+  std::vector<CharPlacement> out(static_cast<size_t>(std::max(char_count, 0)));
+  for (int i = 0; i < char_count; ++i) {
+    CharPlacement& p = out[static_cast<size_t>(i)];
+    p.code = codes[static_cast<size_t>(i)];
+    p.font_size = FPDFText_GetFontSize(text_page, i);
+    if (!FPDFText_GetCharOrigin(text_page, i, &p.origin_x, &p.origin_y)) p.font_size = 0;
+  }
+  return out;
+}
+
 // Extracts text cells for one page at word granularity, the same shape the
 // in-process poppler path emits: split the character stream on whitespace,
 // take the union of the text rects each word occupies, and read font
@@ -392,10 +406,16 @@ void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
     recovered[at] = recovery.Recover(text_page, i, code);
     codes[at] = recovered[at].empty() ? code : static_cast<unsigned int>(recovered[at][0]);
   }
+  const std::vector<CharPlacement> placements = ReadPlacements(text_page, char_count, codes);
 
   int start = -1;
   for (int i = 0; i <= char_count; ++i) {
-    const bool boundary = i == char_count || IsWordBreak(codes[static_cast<size_t>(i)]);
+    // A superscript or subscript glued to its word ("1https") starts a word.
+    const bool shift = i < char_count && start >= 0 &&
+                       !IsWordBreak(codes[static_cast<size_t>(i)]) &&
+                       ScriptShiftBreak(placements[static_cast<size_t>(i - 1)],
+                                        placements[static_cast<size_t>(i)]);
+    const bool boundary = i == char_count || shift || IsWordBreak(codes[static_cast<size_t>(i)]);
     if (!boundary) {
       if (start < 0) start = i;
       continue;
@@ -452,7 +472,7 @@ void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
       }
     }
     const int word_start = start;
-    start = -1;
+    start = shift ? i : -1;
     if (!has_box) continue;
 
     auto* cell = chunk->add_text_cells();
