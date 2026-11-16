@@ -190,6 +190,7 @@ add_executable(grpc_pdfium
   src/page_space.cpp
   src/pdf_backend_service_impl.cpp
   src/pdfium_engine.cpp
+  src/word_breaks.cpp
   src/pdfium_tier12.cpp
   src/proxy_service_impl.cpp
   src/sha256.cpp
@@ -210,6 +211,7 @@ add_executable(pdf_backend_contract_test
   src/page_space.cpp
   src/pdf_backend_service_impl.cpp
   src/pdfium_engine.cpp
+  src/word_breaks.cpp
   src/pdfium_tier12.cpp
   src/utf8.cpp)
 target_include_directories(pdf_backend_contract_test PRIVATE src)
@@ -222,12 +224,26 @@ add_executable(tier12_fixture_test
   src/page_space.cpp
   src/pdf_backend_service_impl.cpp
   src/pdfium_engine.cpp
+  src/word_breaks.cpp
   src/pdfium_tier12.cpp
   src/sha256.cpp
   src/utf8.cpp)
 target_include_directories(tier12_fixture_test PRIVATE src)
 target_link_libraries(tier12_fixture_test PRIVATE pdf_backend_proto pdfium crypto grpc_pdfium_flags)
 add_test(NAME tier12_fixture COMMAND tier12_fixture_test
+  "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
+
+add_executable(text_cells_test
+  test/text_cells_test.cpp
+  src/page_space.cpp
+  src/pdfium_engine.cpp
+  src/word_breaks.cpp
+  src/pdfium_tier12.cpp
+  src/sha256.cpp
+  src/utf8.cpp)
+target_include_directories(text_cells_test PRIVATE src)
+target_link_libraries(text_cells_test PRIVATE pdf_backend_proto pdfium crypto grpc_pdfium_flags)
+add_test(NAME text_cells COMMAND text_cells_test
   "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
 
 add_executable(pool_roundtrip_test test/pool_roundtrip_test.cpp src/sha256.cpp)
