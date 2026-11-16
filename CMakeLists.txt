@@ -191,6 +191,9 @@ add_executable(grpc_pdfium
   src/pdf_backend_service_impl.cpp
   src/pdfium_engine.cpp
   src/word_breaks.cpp
+  src/cff_encoding.cpp
+  src/glyph_name_text.cpp
+  src/glyph_recovery.cpp
   src/pdfium_tier12.cpp
   src/proxy_service_impl.cpp
   src/sha256.cpp
@@ -212,6 +215,9 @@ add_executable(pdf_backend_contract_test
   src/pdf_backend_service_impl.cpp
   src/pdfium_engine.cpp
   src/word_breaks.cpp
+  src/cff_encoding.cpp
+  src/glyph_name_text.cpp
+  src/glyph_recovery.cpp
   src/pdfium_tier12.cpp
   src/utf8.cpp)
 target_include_directories(pdf_backend_contract_test PRIVATE src)
@@ -225,6 +231,9 @@ add_executable(tier12_fixture_test
   src/pdf_backend_service_impl.cpp
   src/pdfium_engine.cpp
   src/word_breaks.cpp
+  src/cff_encoding.cpp
+  src/glyph_name_text.cpp
+  src/glyph_recovery.cpp
   src/pdfium_tier12.cpp
   src/sha256.cpp
   src/utf8.cpp)
@@ -233,11 +242,30 @@ target_link_libraries(tier12_fixture_test PRIVATE pdf_backend_proto pdfium crypt
 add_test(NAME tier12_fixture COMMAND tier12_fixture_test
   "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
 
+add_executable(glyph_names_test
+  test/glyph_names_test.cpp
+  src/page_space.cpp
+  src/pdfium_engine.cpp
+  src/word_breaks.cpp
+  src/cff_encoding.cpp
+  src/glyph_name_text.cpp
+  src/glyph_recovery.cpp
+  src/pdfium_tier12.cpp
+  src/sha256.cpp
+  src/utf8.cpp)
+target_include_directories(glyph_names_test PRIVATE src)
+target_link_libraries(glyph_names_test PRIVATE pdf_backend_proto pdfium crypto grpc_pdfium_flags)
+add_test(NAME glyph_names COMMAND glyph_names_test
+  "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
+
 add_executable(text_cells_test
   test/text_cells_test.cpp
   src/page_space.cpp
   src/pdfium_engine.cpp
   src/word_breaks.cpp
+  src/cff_encoding.cpp
+  src/glyph_name_text.cpp
+  src/glyph_recovery.cpp
   src/pdfium_tier12.cpp
   src/sha256.cpp
   src/utf8.cpp)

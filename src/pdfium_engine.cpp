@@ -18,6 +18,7 @@
 #include "fpdf_transformpage.h"
 #include "fpdfview.h"
 #include "page_space.h"
+#include "glyph_recovery.h"
 #include "pdfium_tier12.h"
 #include "word_breaks.h"
 
@@ -391,10 +392,19 @@ void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
   // A hyphen pdfium took for a line break reads 0x02 here; GetText writes
   // it as U+FFFE inside the word, and so does this, so "selec-" / "tion"
   // stays one cell that consumers join.
+  // A ligature pdfium could not name reads as a control code; its text
+  // comes from the font's own glyph name ("f_i" is "fi").
+  GlyphRecovery recovery;
+  std::vector<std::u32string> recovered(codes.size());
   for (int i = 0; i < char_count; ++i) {
     const unsigned int code = FPDFText_GetUnicode(text_page, i);
-    codes[static_cast<size_t>(i)] =
-        code == 0x02 || FPDFText_IsHyphen(text_page, i) == 1 ? 0xFFFE : code;
+    const size_t at = static_cast<size_t>(i);
+    if (code == 0x02 || FPDFText_IsHyphen(text_page, i) == 1) {
+      codes[at] = 0xFFFE;
+      continue;
+    }
+    recovered[at] = recovery.Recover(text_page, i, code);
+    codes[at] = recovered[at].empty() ? code : static_cast<unsigned int>(recovered[at][0]);
   }
   const std::vector<CharPlacement> placements = ReadPlacements(text_page, char_count, codes);
 
@@ -414,13 +424,20 @@ void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
     const int count = i - start;
     std::vector<unsigned short> word;
     word.reserve(static_cast<size_t>(count));
-    for (int c = start; c < i; ++c) {
-      const unsigned int code = codes[static_cast<size_t>(c)];
+    auto push = [&word](unsigned int code) {
       if (code > 0xFFFF && code <= 0x10FFFF) {
         word.push_back(static_cast<unsigned short>(0xD800 + ((code - 0x10000) >> 10)));
         word.push_back(static_cast<unsigned short>(0xDC00 + ((code - 0x10000) & 0x3FF)));
       } else {
         word.push_back(static_cast<unsigned short>(code));
+      }
+    };
+    for (int c = start; c < i; ++c) {
+      const std::u32string& text = recovered[static_cast<size_t>(c)];
+      if (text.empty()) {
+        push(codes[static_cast<size_t>(c)]);
+      } else {
+        for (char32_t unit : text) push(static_cast<unsigned int>(unit));
       }
     }
 
