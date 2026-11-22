@@ -1,6 +1,6 @@
 // Tier 0 contract test: start the engine-backed service in process, dial
-// it through the generated client stubs, and check Probe, Parse, and
-// Render against the hello.pdf fixture (one Letter page, Helvetica 24pt
+// it through the generated client stubs, and check Probe, Parse, Render
+// and ParseStream against the hello.pdf fixture (one Letter page, Helvetica 24pt
 // "Hello PDF" at (100, 700)).
 
 #include <cmath>
@@ -15,7 +15,9 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include "parse_stream_checks.h"
 #include "pdf_backend_service_impl.h"
+#include "sha256.h"
 
 namespace pdfv1 = ai::protomolt::parse::pdf::v1;
 
@@ -399,6 +401,12 @@ int main(int argc, char** argv) {
     Check(reader->Finish().error_code() == grpc::RESOURCE_EXHAUSTED,
           "oversized raster is RESOURCE_EXHAUSTED");
   }
+
+  // ParseStream on the in-process (kAny) service: chunked upload, the
+  // open's parse, ParsePages and RenderPages on the same stream, cancel,
+  // the hash check, and the protocol's refusals.
+  parse_stream_checks::CheckAll(stub.get(), fixture,
+                                grpc_pdfium::Sha256Hex(fixture), Check);
 
   server->Shutdown();
   if (failures == 0) {

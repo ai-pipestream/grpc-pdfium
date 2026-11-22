@@ -38,6 +38,17 @@ class PdfBackendServiceImpl final
       grpc::ServerWriter<ai::protomolt::parse::pdf::v1::RenderResponse>*
           writer) override;
 
+  // Served only by a kAny service (a worker started without --role, the
+  // in-process service the tests use): one stream both parses and renders,
+  // which the role split forbids, so the front assembles a stream itself
+  // and forwards its requests by role. A text or render worker refuses it
+  // with FAILED_PRECONDITION.
+  grpc::Status ParseStream(
+      grpc::ServerContext* context,
+      grpc::ServerReaderWriter<
+          ai::protomolt::parse::pdf::v1::ParseStreamResponse,
+          ai::protomolt::parse::pdf::v1::ParseStreamRequest>* stream) override;
+
   grpc::Status GetServiceInfo(
       grpc::ServerContext* context,
       const ai::protomolt::parse::pdf::v1::ServiceInfoRequest* request,

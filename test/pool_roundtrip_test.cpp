@@ -45,6 +45,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "ai/protomolt/parse/pdf/v1/pdf_backend_service.grpc.pb.h"
+#include "parse_stream_checks.h"
 #include "sha256.h"
 
 namespace pdfv1 = ai::protomolt::parse::pdf::v1;
@@ -761,6 +762,23 @@ int main(int argc, char** argv) {
               "the newest junk document stayed cached");
       }
     }
+
+    // ParseStream through the front: the chunked upload is assembled in
+    // the front, the open and ParsePages go to text workers and RenderPages
+    // to render workers, and a cancel ends its request. A verified upload
+    // lands in the byte cache, so a client falling back to the unary RPCs
+    // can address it by hash.
+    parse_stream_checks::CheckAll(stub.get(), fixture, fixture_sha, Check);
+    {
+      grpc::ClientContext ctx;
+      pdfv1::ProbeRequest request;
+      request.mutable_document()->set_sha256(fixture_sha);
+      pdfv1::ProbeResponse response;
+      grpc::Status status = stub->Probe(&ctx, request, &response);
+      Check(status.ok() && response.capabilities().load_status() ==
+                               pdfv1::LOAD_STATUS_OK,
+            "a ParseStream upload is cached for Probe by hash");
+    }
   }
 
   StopFront(&front);
@@ -847,6 +865,21 @@ int main(int argc, char** argv) {
         Check(!rastered && reader->Finish().error_code() ==
                                grpc::StatusCode::FAILED_PRECONDITION,
               "a text worker refuses Render");
+      }
+      {
+        // A stream both parses and renders, which no role worker may do:
+        // the front assembles streams and forwards their requests by role.
+        grpc::ClientContext ctx;
+        auto stream = text_stub->ParseStream(&ctx);
+        pdfv1::ParseStreamRequest open;
+        open.mutable_open()->set_header_only(true);
+        stream->Write(open);
+        stream->WritesDone();
+        pdfv1::ParseStreamResponse message;
+        while (stream->Read(&message)) {
+        }
+        Check(stream->Finish().error_code() == grpc::StatusCode::FAILED_PRECONDITION,
+              "a text worker refuses ParseStream");
       }
       Check(TextCells(text_stub.get(), fixture).size() > 0,
             "a text worker serves Parse");
