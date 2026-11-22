@@ -52,6 +52,19 @@ class ProxyServiceImpl final
       grpc::ServerWriter<ai::protomolt::parse::pdf::v1::RenderResponse>*
           writer) override;
 
+  // The bidirectional session (parse_stream_session.h): the front
+  // assembles the chunked upload itself, then serves the open and every
+  // ParsePages through text workers and every RenderPages through render
+  // workers, as the unary forwards do, several of one stream's requests at
+  // once. The bytes never reach a worker in chunks: each forwarded request
+  // carries them whole, so an upload is bounded by the worker socket's
+  // message limit (kMaxStreamDocumentBytes).
+  grpc::Status ParseStream(
+      grpc::ServerContext* context,
+      grpc::ServerReaderWriter<
+          ai::protomolt::parse::pdf::v1::ParseStreamResponse,
+          ai::protomolt::parse::pdf::v1::ParseStreamRequest>* stream) override;
+
   // Answered by the front itself: the identity is the same for front and
   // workers, so no worker round-trip is needed (and no worker is leased).
   grpc::Status GetServiceInfo(

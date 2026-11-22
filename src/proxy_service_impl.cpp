@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 
+#include "parse_stream_session.h"
 #include "pdfium_engine.h"
 #include "request_checks.h"
 #include "service_info.h"
@@ -107,6 +109,17 @@ void FillVerdictCapabilities(pdfv1::BackendCapabilities* caps,
   caps->set_load_detail(detail);
 }
 
+// The largest ParseStream upload the front accepts: every forwarded request
+// carries the bytes whole over the worker socket, whose message limit is
+// 520 MiB (worker_pool.cpp), so this leaves room for the request around
+// them.
+constexpr uint64_t kMaxStreamDocumentBytes = 512ull * 1024 * 1024;
+
+// How many of one ParseStream's requests the front forwards at once: enough
+// to keep both default render workers busy beside a text worker, and no
+// more than one stream's share of the default pool.
+constexpr unsigned kStreamParallelRequests = 3;
+
 // One forwarded call's view of the pool: the role of worker it needs, the
 // client call it serves, and how long it may wait for a free worker.
 struct Forwarding {
@@ -190,22 +203,32 @@ Settled SettleAttempt(const Forwarding& fwd, const WorkerPool::Lease& lease,
           true};
 }
 
+// The message type a worker stream reads; for decltype only.
+template <typename Response>
+Response ReadTypeOf(grpc::ClientReader<Response>* reader);
+
 // Forwards one server-streaming RPC through a leased worker. Retries once
 // on a fresh worker when the first attempt fails before any message was
-// forwarded.
-template <typename Request, typename Response, typename StartFn>
+// forwarded. writer is the unary RPC's ServerWriter or a ParseStream
+// request's sink; a stream request's cancel, when given, ends the worker
+// call the moment it arrives, as a client that went away does.
+template <typename Request, typename Writer, typename StartFn>
 grpc::Status ForwardStreaming(const Forwarding& fwd,
-                              WorkerRequest<Request>* request,
-                              grpc::ServerWriter<Response>* writer,
-                              const StartFn& start) {
+                              WorkerRequest<Request>* request, Writer* writer,
+                              const StartFn& start,
+                              RequestCancel* cancel = nullptr) {
   Settled settled;
   for (int attempt = 0; attempt < 2; ++attempt) {
     WorkerPool::Lease lease;
     grpc::Status waited = AcquireWorker(fwd, &lease);
     if (!waited.ok()) return waited;
     std::unique_ptr<grpc::ClientContext> worker_ctx = WorkerContext(fwd);
+    if (cancel != nullptr) {
+      grpc::ClientContext* ctx = worker_ctx.get();
+      cancel->SetHook([ctx] { ctx->TryCancel(); });
+    }
     auto reader = start(lease.stub, worker_ctx.get(), request->Get());
-    Response message;
+    decltype(ReadTypeOf(reader.get())) message;
     bool forwarded_any = false;
     bool client_gone = false;
     while (reader->Read(&message)) {
@@ -218,6 +241,12 @@ grpc::Status ForwardStreaming(const Forwarding& fwd,
       fwd.pool->Touch(lease);
     }
     const grpc::Status status = reader->Finish();
+    if (cancel != nullptr) {
+      cancel->ClearHook();
+      // A cancelled stream request is a client that went away: the worker
+      // call is abandoned, never retried.
+      client_gone = client_gone || cancel->cancelled();
+    }
     settled = SettleAttempt(fwd, lease, status, client_gone, forwarded_any);
     if (!settled.retry) break;
   }
@@ -329,6 +358,53 @@ grpc::Status ProxyServiceImpl::Render(grpc::ServerContext* context,
       &forwarded, writer,
       [](pdfv1::PdfBackendService::Stub* stub, grpc::ClientContext* ctx,
          const pdfv1::RenderRequest& req) { return stub->Render(ctx, req); });
+}
+
+grpc::Status ProxyServiceImpl::ParseStream(
+    grpc::ServerContext* context,
+    grpc::ServerReaderWriter<pdfv1::ParseStreamResponse, pdfv1::ParseStreamRequest>*
+        stream) {
+  ParseStreamHandlers handlers;
+  handlers.parse = [this, context](const pdfv1::ParseRequest& request,
+                                   const std::shared_ptr<std::string>& bytes,
+                                   MessageSink<pdfv1::ParseResponse>* sink,
+                                   RequestCancel* cancel) {
+    grpc::Status checked = CheckParseRequest(request);
+    if (!checked.ok()) return checked;
+    WorkerRequest<pdfv1::ParseRequest> forwarded(request, bytes);
+    return ForwardStreaming(
+        StartForwarding(pool_, WorkerRole::kText, context, queue_limit_),
+        &forwarded, sink,
+        [](pdfv1::PdfBackendService::Stub* stub, grpc::ClientContext* ctx,
+           const pdfv1::ParseRequest& req) { return stub->Parse(ctx, req); },
+        cancel);
+  };
+  handlers.render = [this, context](const pdfv1::RenderRequest& request,
+                                    const std::shared_ptr<std::string>& bytes,
+                                    MessageSink<pdfv1::RenderResponse>* sink,
+                                    RequestCancel* cancel) {
+    grpc::Status checked = CheckRenderRequest(request);
+    if (!checked.ok()) return checked;
+    WorkerRequest<pdfv1::RenderRequest> forwarded(request, bytes);
+    return ForwardStreaming(
+        StartForwarding(pool_, WorkerRole::kRender, context, queue_limit_),
+        &forwarded, sink,
+        [](pdfv1::PdfBackendService::Stub* stub, grpc::ClientContext* ctx,
+           const pdfv1::RenderRequest& req) { return stub->Render(ctx, req); },
+        cancel);
+  };
+  handlers.verdict = FillVerdictCapabilities;
+  handlers.sha256_hex = Sha256Hex;
+  // A verified upload is cached like a verified unary upload, so a client
+  // that falls back to Probe, Parse or Render can address it by hash.
+  handlers.verified = [this](const std::string& sha256,
+                             const std::shared_ptr<std::string>& bytes) {
+    cache_->Put(sha256, bytes);
+  };
+  ParseStreamLimits limits;
+  limits.max_document_bytes = kMaxStreamDocumentBytes;
+  limits.max_parallel_requests = kStreamParallelRequests;
+  return ServeParseStream(context, stream, handlers, limits);
 }
 
 grpc::Status ProxyServiceImpl::GetServiceInfo(

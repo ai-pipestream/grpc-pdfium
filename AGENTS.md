@@ -72,6 +72,16 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   dumps (`src/main.cpp`): PDFium decodes whole streams with no size check
   of its own, so that limit, not the engine's payload ceilings, is what
   bounds a decompression bomb.
+- `ParseStream` (bidi) is assembled in the FRONT (`src/proxy_service_impl.cpp`,
+  `src/parse_stream_session.*`): the front takes the chunked upload, then
+  forwards the open and every `ParsePages` to text workers and every
+  `RenderPages` to render workers as ordinary Parse/Render calls carrying the
+  whole bytes, up to three of one stream's requests at once, so the role split
+  holds. A `Cancel` ends its worker call (the lease is abandoned like a client
+  that went away). Uploads are capped at 512 MiB (the worker socket's message
+  limit); a verified upload goes into the byte cache. Role workers refuse
+  `ParseStream` with FAILED_PRECONDITION; only a `kAny` service (the
+  in-process tests) serves it directly.
 - Default port is 50069 (`GRPC_PDFIUM_PORT` overrides). 50051/50052/50053
   belong to gRParse, grPOIc, and grpc-libreoffice; the PDF backends own
   50069 (pdfium), 50070 (qparse), 50071 (poppler) in the workspace table.

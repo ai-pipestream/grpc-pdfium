@@ -70,7 +70,7 @@ endif()
 # GitHub-hosted runners cannot resolve the Forgejo host, and the per-file
 # sha256 pins below verify the bytes either way.
 # ---------------------------------------------------------------------------
-set(PDF_PROTOS_COMMIT "56e78a9186607847828fc3ef95f06daab2cc7209"
+set(PDF_PROTOS_COMMIT "dce4e90542329601b4604f0f49daea5b2de24c46"
     CACHE STRING "parser-protos commit the contract comes from")
 set(PDF_PROTOS_BASE_URL
     "https://raw.githubusercontent.com/ai-pipestream/parser-protos/${PDF_PROTOS_COMMIT}/proto/ai/protomolt/parse/pdf/v1"
@@ -79,7 +79,7 @@ set(PDF_PROTO_TYPES_SHA256
     "c8a556c4f978c22f918d9dcbdb765951f591f6598cd59edef83bc75e855b2d44"
     CACHE STRING "sha256 of pdf_backend_types.proto")
 set(PDF_PROTO_SERVICE_SHA256
-    "f0d47132b48af9cf09007afac32b26ef8f8e521b16f7bc105780d6afef5e4e8a"
+    "82cfb08ff4460ddaf0e4c366678951f38d189bdb2226424fdf2a7cf896cbe8da"
     CACHE STRING "sha256 of pdf_backend_service.proto")
 set(PDF_PROTO_LOCAL_DIR "" CACHE PATH "directory holding the contract protos, instead of the pinned download")
 
@@ -188,6 +188,7 @@ add_executable(grpc_pdfium
   src/main.cpp
   src/byte_cache.cpp
   src/page_space.cpp
+  src/parse_stream_session.cpp
   src/pdf_backend_service_impl.cpp
   src/pdfium_engine.cpp
   src/word_breaks.cpp
@@ -212,6 +213,7 @@ enable_testing()
 add_executable(pdf_backend_contract_test
   test/contract_roundtrip_test.cpp
   src/page_space.cpp
+  src/parse_stream_session.cpp
   src/pdf_backend_service_impl.cpp
   src/pdfium_engine.cpp
   src/word_breaks.cpp
@@ -219,15 +221,17 @@ add_executable(pdf_backend_contract_test
   src/glyph_name_text.cpp
   src/glyph_recovery.cpp
   src/pdfium_tier12.cpp
+  src/sha256.cpp
   src/utf8.cpp)
 target_include_directories(pdf_backend_contract_test PRIVATE src)
-target_link_libraries(pdf_backend_contract_test PRIVATE pdf_backend_proto pdfium grpc_pdfium_flags)
+target_link_libraries(pdf_backend_contract_test PRIVATE pdf_backend_proto pdfium crypto grpc_pdfium_flags)
 add_test(NAME contract_roundtrip COMMAND pdf_backend_contract_test
   "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/hello.pdf")
 
 add_executable(tier12_fixture_test
   test/tier12_fixture_test.cpp
   src/page_space.cpp
+  src/parse_stream_session.cpp
   src/pdf_backend_service_impl.cpp
   src/pdfium_engine.cpp
   src/word_breaks.cpp
