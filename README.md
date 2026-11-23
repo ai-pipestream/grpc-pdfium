@@ -120,7 +120,10 @@ cmake -S . -B build -DPDF_PROTO_LOCAL_DIR=/path/to/gRParse/backends
 GRPC_PDFIUM_PORT=50100 ./build/grpc_pdfium   # env override
 ```
 
-Health and server reflection are enabled; `Probe`, `Parse`, `Render`, and
+Health and server reflection are enabled. The health service follows the
+worker pool: it answers `NOT_SERVING` while the text role or the render role
+has no worker up, and the front exits at startup, before it binds, when a
+worker cannot be started. `Probe`, `Parse`, `Render`, and
 `GetServiceInfo` are the service surface. `GetServiceInfo` reports the
 backend identity (`backend_name` and `engine_version` are the same strings
 `Probe` reports), the build version (the image tag in Docker builds, a

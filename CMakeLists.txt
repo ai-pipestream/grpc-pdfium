@@ -278,6 +278,11 @@ target_link_libraries(text_cells_test PRIVATE pdf_backend_proto pdfium crypto gr
 add_test(NAME text_cells COMMAND text_cells_test
   "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
 
+add_executable(worker_pool_test test/worker_pool_test.cpp src/worker_pool.cpp)
+target_include_directories(worker_pool_test PRIVATE src)
+target_link_libraries(worker_pool_test PRIVATE pdf_backend_proto grpc_pdfium_flags)
+add_test(NAME worker_pool COMMAND worker_pool_test)
+
 add_executable(pool_roundtrip_test test/pool_roundtrip_test.cpp src/sha256.cpp)
 target_include_directories(pool_roundtrip_test PRIVATE src)
 target_link_libraries(pool_roundtrip_test PRIVATE pdf_backend_proto crypto grpc_pdfium_flags)

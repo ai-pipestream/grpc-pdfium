@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -239,8 +240,19 @@ int RunFront() {
   grpc::EnableDefaultHealthCheckService(true);
   grpc::reflection::InitProtoReflectionServerBuilderPlugin();
 
-  grpc_pdfium::WorkerPool pool(SelfExe(), socket_dir, text_workers,
-                               render_workers, *request_timeout);
+  // The pool refuses to come up unless every worker does: a front with no
+  // usable worker must not bind and answer health checks.
+  std::unique_ptr<grpc_pdfium::WorkerPool> pool_holder;
+  try {
+    pool_holder = std::make_unique<grpc_pdfium::WorkerPool>(
+        SelfExe(), socket_dir, text_workers, render_workers, *request_timeout);
+  } catch (const std::exception& e) {
+    std::cerr << "grpc-pdfium cannot start its workers: " << e.what()
+              << std::endl;
+    rmdir(socket_dir);
+    return 1;
+  }
+  grpc_pdfium::WorkerPool& pool = *pool_holder;
   grpc_pdfium::ByteCache byte_cache(cache_max_documents, cache_max_bytes);
   grpc_pdfium::ProxyServiceImpl service(&pool, &byte_cache, *queue_timeout);
   grpc::ServerBuilder builder;
@@ -256,6 +268,13 @@ int RunFront() {
     std::cerr << "failed to bind " << address << std::endl;
     return 1;
   }
+  // The health service says what the pool can do: NOT_SERVING while a role
+  // has no worker up, for every service name it knows.
+  if (grpc::HealthCheckServiceInterface* health =
+          server->GetHealthCheckService()) {
+    pool.SetHealthListener(
+        [health](bool serving) { health->SetServingStatus(serving); });
+  }
   // GRPC_PDFIUM_PORT=0 asks for an ephemeral port; the printed address is
   // the bound one either way, and tests parse it from this line.
   std::cout << "grpc-pdfium listening on 0.0.0.0:" << selected_port << " ("
@@ -263,6 +282,8 @@ int RunFront() {
             << text_workers << " text workers, " << render_workers
             << " render workers)" << std::endl;
   server->Wait();
+  // The server, and its health service with it, goes before the pool.
+  pool.SetHealthListener(nullptr);
   return 0;
 }
 
