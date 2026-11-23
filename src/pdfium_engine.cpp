@@ -339,6 +339,8 @@ void FillInventory(FPDF_DOCUMENT doc, const pdfv1::PdfDocument& document,
     }
   }
   const std::function<void()>& progress = ProgressHook();
+  // A page the document counts but PDFium cannot load is left out; Parse
+  // reads the gaps back with UnloadablePages and warns about each.
   for (int i = 0; i < page_count; ++i) {
     ScopedPage page(doc, i);
     if (page.get() != nullptr) FillPageInfo(page.get(), i, pages->Add());
@@ -347,6 +349,30 @@ void FillInventory(FPDF_DOCUMENT doc, const pdfv1::PdfDocument& document,
   if (document.has_sha256()) {
     cache.Insert(document.sha256(), document.data().size(), page_count, *pages);
   }
+}
+
+// The page indices below page_count the inventory does not list: the pages
+// that did not load when it was built. Read from the inventory itself, so
+// a cached one names the same pages as the one just built.
+std::vector<int> UnloadablePages(const InventoryCache::Pages& pages,
+                                 int page_count) {
+  std::vector<bool> listed(static_cast<size_t>(std::max(page_count, 0)));
+  for (const auto& page : pages) {
+    if (page.page_index() < listed.size()) listed[page.page_index()] = true;
+  }
+  std::vector<int> missing;
+  for (size_t i = 0; i < listed.size(); ++i) {
+    if (!listed[i]) missing.push_back(static_cast<int>(i));
+  }
+  return missing;
+}
+
+void WarnUnloadablePage(int index, std::vector<pdfv1::ParseWarning>* warnings) {
+  pdfv1::ParseWarning& warning = warnings->emplace_back();
+  warning.set_page_index(static_cast<uint32_t>(index));
+  warning.set_family(pdfv1::PDF_FAMILY_PAGE_INVENTORY);
+  warning.set_message("pdfium could not load page " + std::to_string(index) +
+                      "; it is left out of the inventory and the page chunks");
 }
 
 // Whitespace as the word splitter: ASCII space controls plus the common
@@ -574,6 +600,11 @@ bool PdfiumEngine::Parse(
   const CropOrigins origins = CropOriginsOf(header->pages());
   const tier12::DocFacts facts = tier12::GatherDocFacts(loaded.doc);
   std::vector<pdfv1::ParseWarning> warnings;
+  // Pages the document counts but PDFium could not load: each is named in
+  // the trailer, whether or not the request's range reaches it, because
+  // the header's inventory is the whole document's.
+  std::vector<int> unloadable = UnloadablePages(header->pages(), page_count);
+  for (const int index : unloadable) WarnUnloadablePage(index, &warnings);
   client_ok = tier12::EmitDocLevelFamilies(loaded.doc, request, facts, origins,
                                            emit, &warnings);
 
@@ -593,13 +624,25 @@ bool PdfiumEngine::Parse(
       tier12::WantFamily(request, pdfv1::PDF_FAMILY_EMBEDDED_FONTS);
   FontInterner fonts;
   std::map<pdfv1::PdfFamily, uint64_t> counts;
-  counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] = static_cast<uint64_t>(page_count);
+  // The pages the inventory lists, which is what the stream carried; a
+  // page that did not load is not one of them.
+  counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] =
+      static_cast<uint64_t>(header->pages_size());
   // Only the requested pages are loaded, one at a time, each closed once
   // its messages are out.
   for (int i = span.begin; client_ok && i < span.end; ++i) {
     ScopedPage loaded_page(loaded.doc, i);
     FPDF_PAGE page = loaded_page.get();
-    if (page == nullptr) continue;
+    if (page == nullptr) {
+      // No chunk for a page that does not load. The inventory pass warned
+      // about it already unless the page loaded then and fails now.
+      if (std::find(unloadable.begin(), unloadable.end(), i) ==
+          unloadable.end()) {
+        unloadable.push_back(i);
+        WarnUnloadablePage(i, &warnings);
+      }
+      continue;
+    }
     pdfv1::ParseResponse page_msg;
     auto* chunk = page_msg.mutable_page();
     chunk->set_page_index(static_cast<uint32_t>(i));
@@ -644,7 +687,14 @@ bool PdfiumEngine::Parse(
     auto* tree = tree_msg.mutable_struct_tree();
     for (int i = 0; i < page_count; ++i) {
       ScopedPage page(loaded.doc, i);
-      if (page.get() == nullptr) continue;
+      if (page.get() == nullptr) {
+        if (std::find(unloadable.begin(), unloadable.end(), i) ==
+            unloadable.end()) {
+          unloadable.push_back(i);
+          WarnUnloadablePage(i, &warnings);
+        }
+        continue;
+      }
       tier12::AppendStructTree(page.get(), static_cast<uint32_t>(i), tree,
                                &counts[pdfv1::PDF_FAMILY_STRUCT_TREE]);
     }
@@ -688,7 +738,12 @@ grpc::Status PdfiumEngine::Render(
   for (int i = span.begin; i < span.end; ++i) {
     ScopedPage loaded_page(loaded.doc, i);
     FPDF_PAGE page = loaded_page.get();
-    if (page == nullptr) continue;
+    if (page == nullptr) {
+      // Never a stream that ends OK with a page missing: the rasters sent
+      // so far stand, and the status names the page.
+      return grpc::Status(grpc::StatusCode::INTERNAL,
+                          "pdfium could not load page " + std::to_string(i));
+    }
     // Size the raster in floating point and check it against the ceiling
     // before any int conversion or allocation. PDFium pads rows to 4 bytes.
     const double width_px =

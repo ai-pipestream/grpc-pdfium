@@ -23,6 +23,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "page_space.h"
+#include "parse_stream_checks.h"
 #include "pdf_backend_service_impl.h"
 #include "pdfium_engine.h"
 #include "sha256.h"
@@ -108,6 +109,24 @@ int OutlineRootsInChild(const std::string& pdf, unsigned limit_seconds) {
   int status = 0;
   if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
   return WEXITSTATUS(status);
+}
+
+// A page tree whose /Count says 3 while it holds one page: PDFium reports
+// three pages and loads only page 0. Two spare objects keep the count
+// under the number of objects.
+std::string MissingPagesPdf() {
+  const std::string content = "BT /F1 24 Tf 72 700 Td (Hello) Tj ET";
+  return AssemblePdf({
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 3 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+      "/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+      "<< /Length " + std::to_string(content.size()) + " >>\nstream\n" +
+          content + "\nendstream",
+      "<< >>",
+      "<< >>",
+  });
 }
 
 pdfv1::FamilySupport SupportOf(const pdfv1::BackendCapabilities& caps,
@@ -1024,6 +1043,104 @@ int main(int argc, char** argv) {
     Check(render(enc_locked, "secret", &first, &messages).ok() && messages == 1 &&
               first.has_raster() && !first.has_head(),
           "locked Render with the password rasterizes");
+  }
+
+  // Pages the document counts but PDFium cannot load are never left out
+  // without a word. Parse lists the pages that loaded, counts those, and
+  // names each missing one in a page-inventory warning (again on a second
+  // call, when the inventory comes from the worker's cache). Render of a
+  // range that holds such a page fails INTERNAL after the rasters before
+  // it, and over ParseStream the request ends ENGINE_ERROR.
+  {
+    const std::string missing = MissingPagesPdf();
+    const std::string missing_sha = grpc_pdfium::Sha256Hex(missing);
+    for (int round = 0; round < 2; ++round) {
+      grpc::ClientContext ctx;
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(missing);
+      request.mutable_document()->set_sha256(missing_sha);
+      auto reader = stub->Parse(&ctx, request);
+      pdfv1::ParseResponse msg;
+      pdfv1::ParseHeader header;
+      pdfv1::ParseTrailer trailer;
+      std::vector<uint32_t> chunks;
+      while (reader->Read(&msg)) {
+        if (msg.has_header()) header = msg.header();
+        if (msg.has_page()) chunks.push_back(msg.page().page_index());
+        if (msg.has_trailer()) trailer = msg.trailer();
+      }
+      Check(reader->Finish().ok(), "missing pages: Parse finishes OK");
+      Check(header.capabilities().load_status() == pdfv1::LOAD_STATUS_OK &&
+                header.capabilities().page_count() == 3,
+            "missing pages: the document loads and counts three pages");
+      Check(header.pages_size() == 1 && header.pages(0).page_index() == 0,
+            "missing pages: the inventory lists only the page that loads");
+      Check(chunks == std::vector<uint32_t>{0},
+            "missing pages: one page chunk, for page 0");
+      uint64_t inventory_count = 99;
+      for (const auto& c : trailer.counts()) {
+        if (c.family() == pdfv1::PDF_FAMILY_PAGE_INVENTORY) {
+          inventory_count = c.count();
+        }
+      }
+      Check(inventory_count == 1,
+            "missing pages: the trailer counts the pages listed, not /Count");
+      std::vector<uint32_t> warned;
+      for (const auto& w : trailer.warnings()) {
+        if (w.has_family() && w.family() == pdfv1::PDF_FAMILY_PAGE_INVENTORY &&
+            w.has_page_index() && !w.message().empty()) {
+          warned.push_back(w.page_index());
+        }
+      }
+      Check(warned == std::vector<uint32_t>({1, 2}),
+            round == 0
+                ? "missing pages: one inventory warning per page that did not load"
+                : "missing pages: the warnings come back with a cached inventory");
+    }
+
+    auto render = [&stub, &missing](uint32_t begin, uint32_t end, int* rasters) {
+      grpc::ClientContext ctx;
+      pdfv1::RenderRequest request;
+      request.mutable_document()->set_data(missing);
+      request.set_dpi(36.0);
+      request.mutable_pages()->set_begin(begin);
+      request.mutable_pages()->set_end(end);
+      auto reader = stub->Render(&ctx, request);
+      pdfv1::RenderResponse message;
+      *rasters = 0;
+      while (reader->Read(&message)) {
+        if (message.has_raster()) ++*rasters;
+      }
+      return reader->Finish();
+    };
+    int rasters = 0;
+    Check(render(0, 1, &rasters).ok() && rasters == 1,
+          "missing pages: Render of the page that loads is OK");
+    grpc::Status status = render(0, 3, &rasters);
+    Check(status.error_code() == grpc::StatusCode::INTERNAL && rasters == 1,
+          "missing pages: Render fails INTERNAL at the first page it cannot load");
+    Check(status.error_message().find("page 1") != std::string::npos,
+          "missing pages: the Render status names the page");
+    status = render(2, 3, &rasters);
+    Check(status.error_code() == grpc::StatusCode::INTERNAL && rasters == 0,
+          "missing pages: Render of only a missing page is INTERNAL, not an empty OK");
+
+    namespace psc = parse_stream_checks;
+    pdfv1::ParseStreamOpen open;
+    open.add_families(pdfv1::PDF_FAMILY_TEXT_CELLS);
+    open.set_sha256(missing_sha);
+    open.set_declared_size(missing.size());
+    pdfv1::ParseStreamRequest render_all = psc::RenderMessage(7, 36.0);
+    render_all.mutable_render()->mutable_pages()->set_end(3);
+    const psc::StreamRun run =
+        psc::Run(stub.get(), psc::Upload(open, missing, missing.size(),
+                                         {{0, render_all}}));
+    Check(run.status.ok(), "missing pages: the ParseStream itself finishes OK");
+    Check(run.DoneOf(7) != nullptr &&
+              run.DoneOf(7)->outcome() == pdfv1::REQUEST_OUTCOME_ENGINE_ERROR,
+          "missing pages: a ParseStream render over a missing page ends ENGINE_ERROR");
+    Check(run.RenderOf(7).size() == 1,
+          "missing pages: the raster before the missing page was sent");
   }
 
   server->Shutdown();
