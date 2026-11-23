@@ -966,6 +966,77 @@ int main(int argc, char** argv) {
     Check(hyphenated, "control-glyphs: a line-break hyphen stays U+FFFE inside one cell");
   }
 
+  // Render draws form widgets unless the request omits annotations. In
+  // rich.pdf the check box at [300 250 315 265] shows its /Yes appearance
+  // (a filled 9 pt square) and the text field at [300 300 450 320] holds
+  // "Jordan Example" with no appearance stream, which the engine writes
+  // from the value. FPDF_RenderPageBitmap alone draws neither, so a filled
+  // form came back with empty fields.
+  {
+    struct Raster {
+      grpc::Status status;
+      pdfv1::PageRaster raster;
+    };
+    auto render = [&stub, &rich](pdfv1::PixelFormat format, bool omit) {
+      grpc::ClientContext ctx;
+      pdfv1::RenderRequest request;
+      request.mutable_document()->set_data(rich);
+      request.set_dpi(72.0);
+      request.set_pixel_format(format);
+      request.set_omit_annotations(omit);
+      auto reader = stub->Render(&ctx, request);
+      pdfv1::RenderResponse message;
+      Raster out;
+      while (reader->Read(&message)) {
+        if (message.has_raster()) out.raster = message.raster();
+      }
+      out.status = reader->Finish();
+      return out;
+    };
+    // Dark pixels inside a rectangle given in page points (origin bottom
+    // left), on a 72 dpi raster of the 612 x 792 page.
+    auto ink = [](const pdfv1::PageRaster& raster, int x0, int y0, int x1,
+                  int y1) {
+      const int channels = raster.pixel_format() == pdfv1::PIXEL_FORMAT_GRAY8 ? 1 : 3;
+      const int height = static_cast<int>(raster.height_px());
+      int dark = 0;
+      for (int y = height - y1; y < height - y0; ++y) {
+        for (int x = x0; x < x1; ++x) {
+          const size_t at = static_cast<size_t>(y) * raster.stride_bytes() +
+                            static_cast<size_t>(x) * channels;
+          if (at + channels > raster.pixels().size()) return -1;
+          for (int c = 0; c < channels; ++c) {
+            if (static_cast<unsigned char>(raster.pixels()[at + c]) < 128) {
+              ++dark;
+              break;
+            }
+          }
+        }
+      }
+      return dark;
+    };
+    for (const pdfv1::PixelFormat format :
+         {pdfv1::PIXEL_FORMAT_BGR8, pdfv1::PIXEL_FORMAT_GRAY8}) {
+      const Raster drawn = render(format, false);
+      Check(drawn.status.ok() && drawn.raster.width_px() == 612 &&
+                drawn.raster.height_px() == 792,
+            "form render: the page rasterizes at 72 dpi");
+      Check(ink(drawn.raster, 300, 250, 315, 265) >= 60,
+            "form render: the checked box is drawn");
+      Check(ink(drawn.raster, 300, 300, 450, 320) >= 100,
+            "form render: the text field's value is drawn");
+      // No field highlight or border is painted over the page: the corner
+      // of the text field stays the background colour.
+      Check(ink(drawn.raster, 440, 302, 448, 304) == 0,
+            "form render: an empty part of the field stays background");
+      const Raster omitted = render(format, true);
+      Check(omitted.status.ok() &&
+                ink(omitted.raster, 300, 250, 315, 265) == 0 &&
+                ink(omitted.raster, 300, 300, 450, 320) == 0,
+            "form render: omit_annotations leaves the widgets out");
+    }
+  }
+
   // signed.pdf: the signature family delivers what is stored.
   {
     ParsedStream s = ParseAll(stub.get(), signed_doc, false);

@@ -229,6 +229,32 @@ PageSpan SelectPages(bool has_range, const pdfv1::PageRange& range,
   return {static_cast<int>(begin), static_cast<int>(end)};
 }
 
+// A read-only form-fill environment over a loaded document: what PDFium
+// needs to read form fields and to draw widgets. A zeroed FPDF_FORMFILLINFO
+// carrying only the version is the setup with no callbacks. Declare it
+// after the LoadedDocument it is opened on, so it closes first.
+class ScopedFormEnvironment {
+ public:
+  ScopedFormEnvironment() {
+    std::memset(&info_, 0, sizeof(info_));
+    info_.version = 2;
+  }
+  ~ScopedFormEnvironment() {
+    if (handle_ != nullptr) FPDFDOC_ExitFormFillEnvironment(handle_);
+  }
+  ScopedFormEnvironment(const ScopedFormEnvironment&) = delete;
+  ScopedFormEnvironment& operator=(const ScopedFormEnvironment&) = delete;
+
+  void Open(FPDF_DOCUMENT doc) {
+    handle_ = FPDFDOC_InitFormFillEnvironment(doc, &info_);
+  }
+  FPDF_FORMHANDLE get() const { return handle_; }
+
+ private:
+  FPDF_FORMFILLINFO info_;
+  FPDF_FORMHANDLE handle_ = nullptr;
+};
+
 // Pages loaded in this process; see PdfiumEngine::PageLoads.
 uint64_t page_loads = 0;
 
@@ -733,6 +759,20 @@ grpc::Status PdfiumEngine::Render(
   const PageSpan span = SelectPages(request.has_pages(), request.pages(),
                                     FPDF_GetPageCount(loaded.doc));
 
+  // FPDF_RenderPageBitmap draws every annotation except form widgets;
+  // those (typed values, check and radio marks) are drawn by FPDF_FFLDraw
+  // through a form-fill environment, which also writes the appearance of
+  // a field that has a value and no appearance stream.
+  ScopedFormEnvironment form;
+  if (!request.omit_annotations()) {
+    form.Open(loaded.doc);
+    if (form.get() == nullptr) {
+      return grpc::Status(grpc::StatusCode::INTERNAL,
+                          "pdfium could not open the form environment that "
+                          "draws form widgets");
+    }
+  }
+
   const bool gray = request.pixel_format() == pdfv1::PIXEL_FORMAT_GRAY8;
   const double scale = request.dpi() / 72.0;
   for (int i = span.begin; i < span.end; ++i) {
@@ -784,6 +824,9 @@ grpc::Status PdfiumEngine::Render(
     FPDFBitmap_FillRect(bitmap, 0, 0, width, height, background);
     int flags = request.omit_annotations() ? 0 : FPDF_ANNOT;
     FPDF_RenderPageBitmap(bitmap, page, 0, 0, width, height, 0, flags);
+    if (form.get() != nullptr) {
+      FPDF_FFLDraw(form.get(), bitmap, page, 0, 0, width, height, 0, flags);
+    }
 
     pdfv1::RenderResponse msg;
     auto* raster = msg.mutable_raster();
