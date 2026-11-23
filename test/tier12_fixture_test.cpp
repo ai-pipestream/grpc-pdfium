@@ -137,6 +137,36 @@ pdfv1::FamilySupport SupportOf(const pdfv1::BackendCapabilities& caps,
   return pdfv1::FAMILY_SUPPORT_UNSPECIFIED;
 }
 
+// Two pages, plus a page object (10) that is in no page tree, the way a
+// file looks after pages were extracted from a larger one. The outline has
+// item "Gone" pointing at the orphan and item "Kept" pointing at page 1.
+// Page 0 carries four links: a GoTo action to the orphan, a direct /Dest
+// to the orphan, a /Dest naming page number 7 of a two-page file, and a
+// GoTo action to page 1.
+std::string DanglingDestinationsPdf() {
+  return AssemblePdf({
+      "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R >>",
+      "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+      "/Annots [8 0 R 9 0 R 11 0 R 12 0 R] >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+      "<< /Type /Outlines /First 6 0 R /Last 7 0 R /Count 2 >>",
+      "<< /Title (Gone) /Parent 5 0 R /Next 7 0 R "
+      "/Dest [10 0 R /XYZ 10 20 0] >>",
+      "<< /Title (Kept) /Parent 5 0 R /Prev 6 0 R "
+      "/Dest [4 0 R /XYZ 30 40 0] >>",
+      "<< /Type /Annot /Subtype /Link /Rect [10 10 50 30] "
+      "/A << /S /GoTo /D [10 0 R /Fit] >> >>",
+      "<< /Type /Annot /Subtype /Link /Rect [10 40 50 60] "
+      "/Dest [10 0 R /Fit] >>",
+      "<< /Type /Page /MediaBox [0 0 612 792] >>",
+      "<< /Type /Annot /Subtype /Link /Rect [10 70 50 90] /Dest [7 /Fit] >>",
+      "<< /Type /Annot /Subtype /Link /Rect [10 100 50 120] "
+      "/A << /S /GoTo /D [4 0 R /XYZ 30 40 0] >> >>",
+  });
+}
+
+
 struct ParsedStream {
   pdfv1::ParseHeader header;
   pdfv1::DocMeta doc_meta;
@@ -830,6 +860,60 @@ int main(int argc, char** argv) {
     parse_page(page_tree, &sha, 0);
     Check(signals == 0, "a cached inventory signals nothing");
     grpc_pdfium::PdfiumEngine::SetProgressHook(nullptr);
+  }
+
+  // A link or bookmark whose destination names no page of the document is
+  // never reported as a jump to page 0. The bookmark keeps its title with
+  // no destination, the link is not emitted (the contract: a link the
+  // engine cannot type is not emitted), and the trailer says how many of
+  // each were found.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_data(DanglingDestinationsPdf());
+    auto reader = stub->Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    pdfv1::OutlineChunk outline;
+    std::vector<pdfv1::PageChunk> pages;
+    pdfv1::ParseTrailer trailer;
+    while (reader->Read(&msg)) {
+      if (msg.has_outline()) outline = msg.outline();
+      if (msg.has_page()) pages.push_back(msg.page());
+      if (msg.has_trailer()) trailer = msg.trailer();
+    }
+    Check(reader->Finish().ok(), "dangling destinations: Parse finishes OK");
+    Check(outline.roots_size() == 2 && outline.roots(0).title() == "Gone" &&
+              outline.roots(1).title() == "Kept",
+          "dangling destinations: both bookmarks are listed");
+    Check(outline.roots_size() == 2 && !outline.roots(0).has_destination() &&
+              !outline.roots(0).has_uri(),
+          "dangling destinations: a bookmark to a missing page has no destination");
+    Check(outline.roots_size() == 2 && outline.roots(1).has_destination() &&
+              outline.roots(1).destination().page_index() == 1 &&
+              outline.roots(1).destination().x() == 30,
+          "dangling destinations: a bookmark to a real page keeps its destination");
+    Check(pages.size() == 2 && pages[0].hyperlinks_size() == 1 &&
+              pages[0].hyperlinks(0).has_destination() &&
+              pages[0].hyperlinks(0).destination().page_index() == 1 &&
+              pages[0].hyperlinks(0).bbox().y0() == 100,
+          "dangling destinations: only the link to a real page is emitted");
+    int outline_warnings = 0;
+    int link_warnings = 0;
+    for (const auto& w : trailer.warnings()) {
+      if (!w.has_family() || w.message().empty()) continue;
+      if (w.family() == pdfv1::PDF_FAMILY_OUTLINE && !w.has_page_index() &&
+          w.message().rfind("1 ", 0) == 0) {
+        ++outline_warnings;
+      }
+      if (w.family() == pdfv1::PDF_FAMILY_HYPERLINKS && w.has_page_index() &&
+          w.page_index() == 0 && w.message().rfind("3 ", 0) == 0) {
+        ++link_warnings;
+      }
+    }
+    Check(outline_warnings == 1,
+          "dangling destinations: one outline warning counts the bookmark");
+    Check(link_warnings == 1,
+          "dangling destinations: one page warning counts the three links");
   }
 
   // form-xobject.pdf: text drawn with 3 Tr is the invisible OCR underlay,
