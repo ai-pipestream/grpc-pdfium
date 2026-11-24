@@ -39,8 +39,10 @@ class PdfiumEngine {
                     ai::protomolt::parse::pdf::v1::BackendCapabilities* caps);
 
   // Parses the tier 0 families, invoking emit for each stream message
-  // (header first, then one PageChunk per page, then the trailer). Returns
-  // false only when emit returned false (client gone).
+  // (header first, then one PageChunk per page, then the trailer). A page
+  // the document counts but PDFium cannot load has no PageInfo and no
+  // PageChunk, and the trailer names it in a PAGE_INVENTORY warning.
+  // Returns false only when emit returned false (client gone).
   static bool Parse(
       const ai::protomolt::parse::pdf::v1::ParseRequest& request,
       const std::function<
@@ -50,7 +52,8 @@ class PdfiumEngine {
   // CheckRenderRequest, invoking emit per raster. A document that does not
   // load is answered OK with one head message carrying the typed load
   // status, as the contract requires. A raster above the byte ceiling is
-  // RESOURCE_EXHAUSTED; CANCELLED means emit returned false (client gone).
+  // RESOURCE_EXHAUSTED; a page PDFium cannot load is INTERNAL, after the
+  // rasters before it; CANCELLED means emit returned false (client gone).
   static grpc::Status Render(
       const ai::protomolt::parse::pdf::v1::RenderRequest& request,
       const std::function<
