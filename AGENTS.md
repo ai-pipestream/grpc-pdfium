@@ -89,6 +89,14 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   limit); a verified upload goes into the byte cache. Role workers refuse
   `ParseStream` with FAILED_PRECONDITION; only a `kAny` service (the
   in-process tests) serves it directly.
+- PDFium has depth limits of its own and reports nothing when they cut:
+  no content of a form XObject nested more than 40 forms deep, no
+  structure element more than 32 levels below the root. `src/pdfium_tier12.cpp`
+  turns both into warnings (`kPdfiumFormLevels`, `kPdfiumStructLevels`; the
+  structure check compares the page's MCIDs with the ones the returned
+  nodes own) and `tier12_fixture_test` pins the two numbers, so a PDFium
+  upgrade that moves a limit fails the test. Do not drop anything on a
+  page or in a tree without a `ParseWarning` in its family.
 - Default port is 50069 (`GRPC_PDFIUM_PORT` overrides). 50051/50052/50053
   belong to gRParse, grPOIc, and grpc-libreoffice; the PDF backends own
   50069 (pdfium), 50070 (qparse), 50071 (poppler) in the workspace table.

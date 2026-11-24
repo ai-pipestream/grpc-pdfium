@@ -70,7 +70,7 @@ endif()
 # GitHub-hosted runners cannot resolve the Forgejo host, and the per-file
 # sha256 pins below verify the bytes either way.
 # ---------------------------------------------------------------------------
-set(PDF_PROTOS_COMMIT "dce4e90542329601b4604f0f49daea5b2de24c46"
+set(PDF_PROTOS_COMMIT "55db54ed2a49397bb76e3846a67853b58fe7c140"
     CACHE STRING "parser-protos commit the contract comes from")
 set(PDF_PROTOS_BASE_URL
     "https://raw.githubusercontent.com/ai-pipestream/parser-protos/${PDF_PROTOS_COMMIT}/proto/ai/protomolt/parse/pdf/v1"
@@ -79,7 +79,7 @@ set(PDF_PROTO_TYPES_SHA256
     "c8a556c4f978c22f918d9dcbdb765951f591f6598cd59edef83bc75e855b2d44"
     CACHE STRING "sha256 of pdf_backend_types.proto")
 set(PDF_PROTO_SERVICE_SHA256
-    "82cfb08ff4460ddaf0e4c366678951f38d189bdb2226424fdf2a7cf896cbe8da"
+    "c879d73aeacb6231d3ff8737602b362144629ebeaf6e4b9ad7754c1763eaf9cb"
     CACHE STRING "sha256 of pdf_backend_service.proto")
 set(PDF_PROTO_LOCAL_DIR "" CACHE PATH "directory holding the contract protos, instead of the pinned download")
 

@@ -267,11 +267,23 @@ std::vector<FPDF_BOOKMARK> UnseenChildren(FPDF_DOCUMENT doc,
   return children;
 }
 
+// Levels of nesting the outline and the structure tree are followed to.
+// What lies deeper is left out and said in a warning.
+constexpr int kMaxNestingDepth = 64;
+// PDFium's own limits, which cut before that one and say nothing. It does
+// not read the content of a form XObject nested more than 40 forms deep
+// (the form object is there and holds no objects), and it does not attach
+// a structure element whose chain of parents is longer than 32 to the
+// tree. tier12_fixture_test pins both numbers.
+constexpr int kPdfiumFormLevels = 40;
+constexpr int kPdfiumStructLevels = 32;
+
 // An item whose destination names no page of the document keeps its title
-// with no destination and is counted in unresolved.
+// with no destination and is counted in unresolved. Items directly under
+// the deepest level that is followed are counted in cut.
 void FillOutline(FPDF_DOCUMENT doc, FPDF_BOOKMARK bookmark,
                  pdfv1::OutlineNode* node, int depth, SeenBookmarks* seen,
-                 uint64_t* unresolved) {
+                 uint64_t* unresolved, uint64_t* cut) {
   node->set_title(Utf16Field([bookmark](void* buf, unsigned long len) {
     return FPDFBookmark_GetTitle(bookmark, buf, len);
   }));
@@ -301,9 +313,14 @@ void FillOutline(FPDF_DOCUMENT doc, FPDF_BOOKMARK bookmark,
   }
   // Each item is visited once (seen), which ends a /First or /Next loop;
   // the depth cap bounds a chain that is merely deep.
-  if (depth >= 64) return;
-  for (FPDF_BOOKMARK child : UnseenChildren(doc, bookmark, seen)) {
-    FillOutline(doc, child, node->add_children(), depth + 1, seen, unresolved);
+  const std::vector<FPDF_BOOKMARK> children = UnseenChildren(doc, bookmark, seen);
+  if (depth >= kMaxNestingDepth) {
+    *cut += children.size();
+    return;
+  }
+  for (FPDF_BOOKMARK child : children) {
+    FillOutline(doc, child, node->add_children(), depth + 1, seen, unresolved,
+                cut);
   }
 }
 
@@ -313,7 +330,14 @@ bool EmitAttachments(FPDF_DOCUMENT doc, bool include_data,
   int count = FPDFDoc_GetAttachmentCount(doc);
   for (int i = 0; i < count; ++i) {
     FPDF_ATTACHMENT att = FPDFDoc_GetAttachment(doc, i);
-    if (att == nullptr) continue;
+    if (att == nullptr) {
+      Warn(warnings, std::nullopt, pdfv1::PDF_FAMILY_ATTACHMENTS,
+           "attachment " + std::to_string(i + 1) + " of " +
+               std::to_string(count) +
+               " is left out: pdfium could not open its entry in the "
+               "embedded files tree");
+      continue;
+    }
     pdfv1::ParseResponse msg;
     auto* meta = msg.mutable_attachment();
     meta->set_name(Utf16Field([att](void* buf, unsigned long len) {
@@ -342,11 +366,22 @@ bool EmitAttachments(FPDF_DOCUMENT doc, bool include_data,
     // the size is only known (and the optional size_bytes only set) when
     // the data was asked for. A Parse that did not ask never decodes an
     // attachment, so a bomb fails only the request that wanted its bytes.
+    // A file specification with no embedded stream (it names a file kept
+    // somewhere else) has no bytes to give; a stream that is there and
+    // empty is a file of size 0.
     unsigned long size = 0;
-    if (include_data && FPDFAttachment_GetFile(att, nullptr, 0, &size) &&
-        size > 0) {
+    if (!include_data) {
+      // Nothing was asked for and nothing is decoded.
+    } else if (!FPDFAttachment_GetFile(att, nullptr, 0, &size)) {
+      Warn(warnings, std::nullopt, pdfv1::PDF_FAMILY_ATTACHMENTS,
+           "attachment " + meta->name() +
+               " has no data: its file specification holds no embedded "
+               "file stream pdfium can read");
+    } else {
       meta->set_size_bytes(size);
-      if (size > kMaxAttachmentBytes) {
+      if (size == 0) {
+        // An empty file: the size says it all.
+      } else if (size > kMaxAttachmentBytes) {
         Warn(warnings, std::nullopt, pdfv1::PDF_FAMILY_ATTACHMENTS,
              "attachment " + meta->name() + " data left out: " +
                  std::to_string(size) + " bytes is above the " +
@@ -354,9 +389,14 @@ bool EmitAttachments(FPDF_DOCUMENT doc, bool include_data,
       } else {
         std::string data(size, '\0');
         unsigned long got = 0;
-        if (FPDFAttachment_GetFile(att, data.data(), size, &got)) {
-          data.resize(std::min(got, size));
+        if (FPDFAttachment_GetFile(att, data.data(), size, &got) &&
+            got == size) {
           meta->set_data(std::move(data));
+        } else {
+          Warn(warnings, std::nullopt, pdfv1::PDF_FAMILY_ATTACHMENTS,
+               "attachment " + meta->name() + " data left out: pdfium " +
+                   "reported " + std::to_string(size) +
+                   " bytes and then could not read them");
         }
       }
     }
@@ -516,30 +556,47 @@ constexpr std::array<SubtypeEntry, 29> kSubtypes{{
     {pdfv1::ANNOTATION_KIND_REDACT, "Redact"},
 }};
 
-void FillAnnotations(FPDF_PAGE page, pdfv1::PageChunk* chunk) {
+// subtype_raw is the annotation's own /Subtype name. PDFium numbers the
+// subtypes it knows and reports every other one as number 0, so the name
+// is read from the dictionary; the table only supplies the kind, and the
+// name where the dictionary read comes back empty for a subtype PDFium
+// did recognise.
+void FillAnnotations(FPDF_PAGE page, pdfv1::PageChunk* chunk,
+                     std::vector<pdfv1::ParseWarning>* warnings) {
   int count = FPDFPage_GetAnnotCount(page);
+  uint64_t unnamed = 0;
+  uint64_t unopened = 0;
   for (int i = 0; i < count; ++i) {
     FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, i);
-    if (annot == nullptr) continue;
+    if (annot == nullptr) {
+      ++unopened;
+      continue;
+    }
     auto* out = chunk->add_annotations();
-    int subtype = FPDFAnnot_GetSubtype(annot);
-    if (subtype >= 0 && subtype < static_cast<int>(kSubtypes.size())) {
-      out->set_kind(kSubtypes[static_cast<size_t>(subtype)].kind);
-      out->set_subtype_raw(kSubtypes[static_cast<size_t>(subtype)].name);
-    } else {
-      out->set_kind(pdfv1::ANNOTATION_KIND_UNSPECIFIED);
-      out->set_subtype_raw("Unknown");
-    }
-    FS_RECTF rect;
-    if (FPDFAnnot_GetRect(annot, &rect)) {
-      SetBox(out->mutable_rect(), rect.left, rect.bottom, rect.right, rect.top);
-    }
     auto str = [annot](const char* key) {
       return Utf16Field([annot, key](void* buf, unsigned long len) {
         return FPDFAnnot_GetStringValue(annot, key,
                                         static_cast<FPDF_WCHAR*>(buf), len);
       });
     };
+    int subtype = FPDFAnnot_GetSubtype(annot);
+    const bool listed = subtype > FPDF_ANNOT_UNKNOWN &&
+                        subtype < static_cast<int>(kSubtypes.size());
+    out->set_kind(listed ? kSubtypes[static_cast<size_t>(subtype)].kind
+                         : pdfv1::ANNOTATION_KIND_UNSPECIFIED);
+    std::string name = str("Subtype");
+    if (name.empty() && listed) {
+      name = kSubtypes[static_cast<size_t>(subtype)].name;
+    }
+    if (name.empty()) {
+      ++unnamed;
+    } else {
+      out->set_subtype_raw(name);
+    }
+    FS_RECTF rect;
+    if (FPDFAnnot_GetRect(annot, &rect)) {
+      SetBox(out->mutable_rect(), rect.left, rect.bottom, rect.right, rect.top);
+    }
     std::string v;
     if (!(v = str("Contents")).empty()) out->set_contents(v);
     if (!(v = str("T")).empty()) out->set_author(v);
@@ -571,6 +628,18 @@ void FillAnnotations(FPDF_PAGE page, pdfv1::PageChunk* chunk) {
       color->set_alpha(a / 255.0);
     }
     FPDFPage_CloseAnnot(annot);
+  }
+  if (unnamed > 0) {
+    Warn(warnings, chunk->page_index(), pdfv1::PDF_FAMILY_ANNOTATIONS,
+         std::to_string(unnamed) +
+             " annotation(s) have no /Subtype name; each is listed with an "
+             "empty subtype_raw");
+  }
+  if (unopened > 0) {
+    Warn(warnings, chunk->page_index(), pdfv1::PDF_FAMILY_ANNOTATIONS,
+         std::to_string(unopened) + " of the page's " + std::to_string(count) +
+             " /Annots entries are not annotations pdfium could open and "
+             "are left out");
   }
 }
 
@@ -774,9 +843,25 @@ void FillImageData(FPDF_PAGEOBJECT obj, pdfv1::PlacedImage* image,
     return;
   }
   FPDF_BITMAP bitmap = FPDFImageObj_GetBitmap(obj);
-  if (bitmap == nullptr) return;
-  if (BitmapToEncodedImage(bitmap, image->mutable_image())) {
-    *page_image_bytes += image->image().data().size();
+  if (bitmap == nullptr) {
+    Warn(warnings, page_index, pdfv1::PDF_FAMILY_PLACED_IMAGES,
+         "image data left out: pdfium could not decode the " +
+             std::to_string(width) + "x" + std::to_string(height) +
+             " image's samples");
+    return;
+  }
+  // Converted on the side and moved in only when it worked, so a failure
+  // never leaves an empty EncodedImage in the message.
+  pdfv1::EncodedImage encoded;
+  if (BitmapToEncodedImage(bitmap, &encoded)) {
+    *page_image_bytes += encoded.data().size();
+    *image->mutable_image() = std::move(encoded);
+  } else {
+    Warn(warnings, page_index, pdfv1::PDF_FAMILY_PLACED_IMAGES,
+         "image data left out: pdfium could not decode the " +
+             std::to_string(width) + "x" + std::to_string(height) +
+             " image into a pixel layout this service carries (bitmap "
+             "format " + std::to_string(FPDFBitmap_GetFormat(bitmap)) + ")");
   }
   FPDFBitmap_Destroy(bitmap);
 }
@@ -969,13 +1054,18 @@ struct ObjectWalk {
   std::vector<pdfv1::ParseWarning>* warnings;
   // Decoded image pixels placed in the chunk so far.
   uint64_t* image_bytes;
+  // Form XObjects whose content is missing: nested deeper than PDFium
+  // reads, and ones whose matrix PDFium could not give.
+  uint64_t* forms_too_deep;
+  uint64_t* forms_without_matrix;
 };
 
 // Visits the objects of the page (form null) or of one Form XObject,
 // descending into nested forms: many generators wrap a whole page in one,
 // and its images, paths and fonts belong to the page all the same. A
 // form's objects live in the form's space; to_page maps that space onto
-// the page. Malformed nesting is cut at a fixed depth.
+// the page. PDFium reads no content of a form below kPdfiumFormLevels, so
+// the walk stops there and counts the forms it met.
 void WalkObjects(const ObjectWalk& walk, FPDF_PAGEOBJECT form,
                  const FS_MATRIX& to_page, int depth) {
   const int count = form == nullptr ? FPDFPage_CountObjects(walk.page)
@@ -1005,7 +1095,11 @@ void WalkObjects(const ObjectWalk& walk, FPDF_PAGEOBJECT form,
       case FPDF_PAGEOBJ_FORM: {
         // The form object's matrix maps the form's space into its parent's.
         FS_MATRIX form_matrix;
-        if (depth < 64 && FPDFPageObj_GetMatrix(obj, &form_matrix)) {
+        if (depth >= kPdfiumFormLevels) {
+          ++*walk.forms_too_deep;
+        } else if (!FPDFPageObj_GetMatrix(obj, &form_matrix)) {
+          ++*walk.forms_without_matrix;
+        } else {
           WalkObjects(walk, obj, Concat(form_matrix, to_page), depth + 1);
         }
         break;
@@ -1016,16 +1110,44 @@ void WalkObjects(const ObjectWalk& walk, FPDF_PAGEOBJECT form,
   }
 }
 
-void FillThumbnail(FPDF_PAGE page, pdfv1::PageChunk* chunk) {
+// A page with no /Thumb has no thumbnail and that is not a warning. One
+// whose /Thumb stream is there and yields no bitmap is.
+void FillThumbnail(FPDF_PAGE page, pdfv1::PageChunk* chunk,
+                   std::vector<pdfv1::ParseWarning>* warnings) {
   FPDF_BITMAP bitmap = FPDFPage_GetThumbnailAsBitmap(page);
-  if (bitmap == nullptr) return;
-  BitmapToEncodedImage(bitmap, chunk->mutable_thumbnail());
+  if (bitmap == nullptr) {
+    if (FPDFPage_GetRawThumbnailData(page, nullptr, 0) > 0) {
+      Warn(warnings, chunk->page_index(), pdfv1::PDF_FAMILY_THUMBNAILS,
+           "thumbnail left out: pdfium could not decode the page's /Thumb "
+           "image");
+    }
+    return;
+  }
+  pdfv1::EncodedImage encoded;
+  if (BitmapToEncodedImage(bitmap, &encoded)) {
+    *chunk->mutable_thumbnail() = std::move(encoded);
+  } else {
+    Warn(warnings, chunk->page_index(), pdfv1::PDF_FAMILY_THUMBNAILS,
+         "thumbnail left out: pdfium could not decode the page's /Thumb "
+         "image into a pixel layout this service carries (bitmap format " +
+             std::to_string(FPDFBitmap_GetFormat(bitmap)) + ")");
+  }
   FPDFBitmap_Destroy(bitmap);
 }
 
+// What one page's structure walk gathers besides the nodes.
+struct StructWalk {
+  // Nodes filled.
+  uint64_t* count;
+  // Marked-content ids the filled nodes own.
+  std::set<int> mcids;
+  // Children directly under the deepest level that is followed.
+  uint64_t cut = 0;
+};
+
 void FillStructElement(FPDF_STRUCTELEMENT elem, uint32_t page_index,
-                       pdfv1::StructNode* node, int depth, uint64_t* count) {
-  ++*count;
+                       pdfv1::StructNode* node, int depth, StructWalk* walk) {
+  ++*walk->count;
   auto str = [elem](auto fn) {
     return Utf16Field([elem, fn](void* buf, unsigned long len) {
       return fn(elem, buf, len);
@@ -1043,16 +1165,22 @@ void FillStructElement(FPDF_STRUCTELEMENT elem, uint32_t page_index,
   for (int m = 0; m < mcid_count; ++m) {
     int mcid = FPDF_StructElement_GetMarkedContentIdAtIndex(elem, m);
     if (mcid < 0) continue;
+    walk->mcids.insert(mcid);
     auto* ref = node->add_content();
     ref->set_page_index(page_index);
     ref->set_mcid(static_cast<uint32_t>(mcid));
   }
-  if (depth >= 64) return;
   int children = FPDF_StructElement_CountChildren(elem);
   for (int c = 0; c < children; ++c) {
+    // A child that is marked content or an object reference has no element
+    // handle; that is not a loss.
     FPDF_STRUCTELEMENT child = FPDF_StructElement_GetChildAtIndex(elem, c);
     if (child == nullptr) continue;
-    FillStructElement(child, page_index, node->add_children(), depth + 1, count);
+    if (depth >= kMaxNestingDepth) {
+      ++walk->cut;
+      continue;
+    }
+    FillStructElement(child, page_index, node->add_children(), depth + 1, walk);
   }
 }
 
@@ -1127,8 +1255,17 @@ bool EmitDocLevelFamilies(
     auto* chunk = msg.mutable_outline();
     SeenBookmarks seen;
     uint64_t unresolved = 0;
+    uint64_t cut = 0;
     for (FPDF_BOOKMARK bookmark : UnseenChildren(doc, nullptr, &seen)) {
-      FillOutline(doc, bookmark, chunk->add_roots(), 0, &seen, &unresolved);
+      FillOutline(doc, bookmark, chunk->add_roots(), 0, &seen, &unresolved,
+                  &cut);
+    }
+    if (cut > 0) {
+      Warn(warnings, std::nullopt, pdfv1::PDF_FAMILY_OUTLINE,
+           std::to_string(cut) + " outline item(s) lie below level " +
+               std::to_string(kMaxNestingDepth + 1) +
+               ", the deepest this service follows; they and every item "
+               "under them are left out");
     }
     if (unresolved > 0) {
       Warn(warnings, std::nullopt, pdfv1::PDF_FAMILY_OUTLINE,
@@ -1173,8 +1310,13 @@ void ExtractPageTier12(FPDF_DOCUMENT doc, FPDF_PAGE page,
       WantFamily(request, pdfv1::PDF_FAMILY_EMBEDDED_FONTS);
   const bool want_fonts =
       WantFamily(request, pdfv1::PDF_FAMILY_FONTS) || want_programs;
-  if (want_images || want_shapes || want_fonts) {
+  // Text cells come from the same page objects, so a form PDFium did not
+  // read costs them too: the walk runs for them as well, only to count.
+  const bool want_text = WantFamily(request, pdfv1::PDF_FAMILY_TEXT_CELLS);
+  if (want_images || want_shapes || want_fonts || want_text) {
     uint64_t image_bytes = 0;
+    uint64_t forms_too_deep = 0;
+    uint64_t forms_without_matrix = 0;
     const ObjectWalk walk{page,
                           want_images,
                           want_shapes,
@@ -1186,35 +1328,107 @@ void ExtractPageTier12(FPDF_DOCUMENT doc, FPDF_PAGE page,
                           new_fonts,
                           embedded_fonts,
                           warnings,
-                          &image_bytes};
+                          &image_bytes,
+                          &forms_too_deep,
+                          &forms_without_matrix};
     WalkObjects(walk, nullptr, kIdentity, 0);
+    if (forms_too_deep > 0 || forms_without_matrix > 0) {
+      std::string message;
+      if (forms_too_deep > 0) {
+        message = std::to_string(forms_too_deep) +
+                  " form XObject(s) are nested more than " +
+                  std::to_string(kPdfiumFormLevels) +
+                  " forms deep, where pdfium reads no content";
+      }
+      if (forms_without_matrix > 0) {
+        if (!message.empty()) message += "; ";
+        message += std::to_string(forms_without_matrix) +
+                   " form XObject(s) have a matrix pdfium could not read";
+      }
+      message += ": whatever they draw is missing from this family";
+      // One warning for each family the forms could have fed.
+      const std::pair<bool, pdfv1::PdfFamily> fed[] = {
+          {want_text, pdfv1::PDF_FAMILY_TEXT_CELLS},
+          {want_images, pdfv1::PDF_FAMILY_PLACED_IMAGES},
+          {want_shapes, pdfv1::PDF_FAMILY_VECTOR_SHAPES},
+          {WantFamily(request, pdfv1::PDF_FAMILY_FONTS),
+           pdfv1::PDF_FAMILY_FONTS},
+      };
+      for (const auto& [wanted, family] : fed) {
+        if (wanted) Warn(warnings, chunk->page_index(), family, message);
+      }
+    }
   }
   if (WantFamily(request, pdfv1::PDF_FAMILY_HYPERLINKS)) {
     FillHyperlinks(doc, page, chunk, warnings);
   }
   if (WantFamily(request, pdfv1::PDF_FAMILY_ANNOTATIONS)) {
-    FillAnnotations(page, chunk);
+    FillAnnotations(page, chunk, warnings);
   }
   if (form_handle != nullptr &&
       WantFamily(request, pdfv1::PDF_FAMILY_FORM_FIELDS)) {
     FillFormFields(form_handle, page, chunk);
   }
   if (WantFamily(request, pdfv1::PDF_FAMILY_THUMBNAILS)) {
-    FillThumbnail(page, chunk);
+    FillThumbnail(page, chunk, warnings);
   }
 }
 
 void AppendStructTree(FPDF_PAGE page, uint32_t page_index,
-                      pdfv1::StructTreeChunk* chunk, uint64_t* node_count) {
+                      pdfv1::StructTreeChunk* chunk, uint64_t* node_count,
+                      std::vector<pdfv1::ParseWarning>* warnings) {
+  StructWalk walk;
+  walk.count = node_count;
   FPDF_STRUCTTREE tree = FPDF_StructTree_GetForPage(page);
-  if (tree == nullptr) return;
-  int children = FPDF_StructTree_CountChildren(tree);
-  for (int c = 0; c < children; ++c) {
-    FPDF_STRUCTELEMENT elem = FPDF_StructTree_GetChildAtIndex(tree, c);
-    if (elem == nullptr) continue;
-    FillStructElement(elem, page_index, chunk->add_roots(), 0, node_count);
+  if (tree != nullptr) {
+    int children = FPDF_StructTree_CountChildren(tree);
+    for (int c = 0; c < children; ++c) {
+      FPDF_STRUCTELEMENT elem = FPDF_StructTree_GetChildAtIndex(tree, c);
+      if (elem == nullptr) continue;
+      FillStructElement(elem, page_index, chunk->add_roots(), 0, &walk);
+    }
+    FPDF_StructTree_Close(tree);
   }
-  FPDF_StructTree_Close(tree);
+  if (walk.cut > 0) {
+    Warn(warnings, page_index, pdfv1::PDF_FAMILY_STRUCT_TREE,
+         std::to_string(walk.cut) + " structure element(s) lie below level " +
+             std::to_string(kMaxNestingDepth + 1) +
+             ", the deepest this service follows; they and every element "
+             "under them are left out");
+  }
+  // PDFium drops what it does not attach without a word, so the page's own
+  // marked content is the check: every run the page draws under an MCID
+  // belongs to some element, and one no returned node owns is structure
+  // that did not arrive. Only the page's own objects are read: the ids
+  // inside a form XObject count from that form's own parent tree entry.
+  std::set<int> orphans;
+  const int objects = FPDFPage_CountObjects(page);
+  for (int i = 0; i < objects; ++i) {
+    FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
+    if (obj == nullptr) continue;
+    const int mcid = FPDFPageObj_GetMarkedContentID(obj);
+    if (mcid >= 0 && walk.mcids.count(mcid) == 0) orphans.insert(mcid);
+  }
+  if (!orphans.empty()) {
+    std::string ids;
+    size_t listed = 0;
+    for (int mcid : orphans) {
+      if (listed == 8) {
+        ids += ", ...";
+        break;
+      }
+      if (listed++ > 0) ids += ", ";
+      ids += std::to_string(mcid);
+    }
+    Warn(warnings, page_index, pdfv1::PDF_FAMILY_STRUCT_TREE,
+         std::to_string(orphans.size()) +
+             " marked-content run(s) of the page (MCID " + ids +
+             ") are under no structure element pdfium returned, so their "
+             "structure is missing; pdfium leaves out an element nested "
+             "more than " + std::to_string(kPdfiumStructLevels) +
+             " levels below the tree's root, and a damaged parent tree does "
+             "the same");
+  }
 }
 
 }  // namespace tier12
