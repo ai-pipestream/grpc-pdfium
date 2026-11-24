@@ -792,7 +792,8 @@ bool PdfiumEngine::Parse(
         continue;
       }
       tier12::AppendStructTree(page.get(), static_cast<uint32_t>(i), tree,
-                               &counts[pdfv1::PDF_FAMILY_STRUCT_TREE]);
+                               &counts[pdfv1::PDF_FAMILY_STRUCT_TREE],
+                               &warnings);
     }
     if (tree->roots_size() > 0) client_ok = emit(tree_msg);
   }

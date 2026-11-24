@@ -67,6 +67,27 @@ character code, and words with no character box. PDFium's own line-break
 hyphen stays U+FFFE inside its cell; a glyph a font draws at character
 code 2 is not taken for one.
 
+What the other families leave out is said the same way, in the family and
+on the page it is about:
+
+- an image or a page thumbnail whose samples PDFium cannot decode (the
+  image stays listed with no `image`, and no thumbnail is sent or counted);
+- an attachment whose bytes were asked for and whose file specification
+  holds no embedded stream, one whose bytes PDFium reported and could not
+  read, and an entry of the embedded files tree PDFium cannot open (an
+  empty embedded file is `size_bytes` 0 and no warning);
+- outline items below level 65, the deepest the walk follows;
+- form XObjects nested more than 40 forms deep: PDFium reads no content
+  there, so text, images, shapes and fonts drawn below that are missing,
+  and each of those families that was asked for gets the warning;
+- marked content of a tagged page that no returned structure element owns:
+  PDFium leaves out structure nested more than 32 levels below the root
+  without a word, and a damaged parent tree loses elements the same way;
+- annotations with no `/Subtype`, and `/Annots` entries PDFium cannot open.
+
+An annotation's `subtype_raw` is the document's own `/Subtype` name, also
+for a subtype PDFium has no number for (its `kind` is then unspecified).
+
 Each worker also runs under an address-space limit,
 `GRPC_PDFIUM_WORKER_MAX_BYTES` (bytes; default 3 GiB, 0 turns it off,
 otherwise at least 256 MiB), with core dumps off. PDFium decodes a stream

@@ -62,10 +62,14 @@ void ExtractPageTier12(
     std::vector<ai::protomolt::parse::pdf::v1::ParseWarning>* warnings);
 
 // Appends one page's structure tree roots to chunk, counting the nodes.
-// Only called for tagged documents.
-void AppendStructTree(FPDF_PAGE page, uint32_t page_index,
-                      ai::protomolt::parse::pdf::v1::StructTreeChunk* chunk,
-                      uint64_t* node_count);
+// Only called for tagged documents. Structure that did not arrive (cut at
+// the depth limit, or marked content of the page no returned element
+// owns) is a warning.
+void AppendStructTree(
+    FPDF_PAGE page, uint32_t page_index,
+    ai::protomolt::parse::pdf::v1::StructTreeChunk* chunk,
+    uint64_t* node_count,
+    std::vector<ai::protomolt::parse::pdf::v1::ParseWarning>* warnings);
 
 // True when the request selects this family (empty selection = all).
 bool WantFamily(const ai::protomolt::parse::pdf::v1::ParseRequest& request,

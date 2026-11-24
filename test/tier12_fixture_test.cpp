@@ -167,6 +167,141 @@ std::string DanglingDestinationsPdf() {
 }
 
 
+std::string StreamObject(const std::string& dict, const std::string& data) {
+  return "<< " + dict + " /Length " + std::to_string(data.size()) +
+         " >>\nstream\n" + data + "\nendstream";
+}
+
+// One page that draws image /Im1 and has a /Thumb. Both are DCT streams
+// that hold no JPEG, so PDFium lists the image and has no pixels for
+// either.
+std::string UndecodableImagesPdf() {
+  const std::string image =
+      "/Type /XObject /Subtype /Image /Width 4 /Height 4 "
+      "/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode";
+  return AssemblePdf({
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+      "/Resources << /XObject << /Im1 5 0 R >> >> /Contents 4 0 R "
+      "/Thumb 6 0 R >>",
+      StreamObject("", "q 100 0 0 100 50 50 cm /Im1 Do Q"),
+      StreamObject(image, "this is not a JPEG"),
+      StreamObject(image, "neither is this one"),
+  });
+}
+
+// Three entries in the embedded files name tree: a file specification with
+// no embedded stream (it names an external file), a reference to an object
+// the file does not hold, and a file whose stream is empty.
+std::string AttachmentsWithoutDataPdf() {
+  return AssemblePdf({
+      "<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles << /Names "
+      "[(empty.txt) 5 0 R (external.txt) 4 0 R (gone.txt) 99 0 R] >> >> >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+      "<< /Type /Filespec /F (external.txt) /UF (external.txt) >>",
+      "<< /Type /Filespec /F (empty.txt) /UF (empty.txt) "
+      "/EF << /F 6 0 R >> >>",
+      StreamObject("/Type /EmbeddedFile", ""),
+  });
+}
+
+// An outline that is one chain: every item is the only child of the one
+// before it, levels items deep.
+std::string DeepOutlinePdf(int levels) {
+  std::vector<std::string> objects = {
+      "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+      "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>",
+  };
+  for (int i = 0; i < levels; ++i) {
+    const int self = 5 + i;
+    std::string item = "<< /Title (L" + std::to_string(i) + ") /Parent " +
+                       std::to_string(self - 1) + " 0 R";
+    if (i + 1 < levels) {
+      const std::string child = std::to_string(self + 1) + " 0 R";
+      item += " /First " + child + " /Last " + child + " /Count 1";
+    }
+    objects.push_back(item + " >>");
+  }
+  return AssemblePdf(objects);
+}
+
+// One page that draws form /F0, which draws /F1, and so on, levels forms
+// deep; the innermost draws a 1x1 gray image.
+std::string NestedFormsPdf(int levels) {
+  std::vector<std::string> objects = {
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+      "/Resources << /XObject << /F0 6 0 R >> >> /Contents 4 0 R >>",
+      StreamObject("", "q /F0 Do Q"),
+      StreamObject("/Type /XObject /Subtype /Image /Width 1 /Height 1 "
+                   "/ColorSpace /DeviceGray /BitsPerComponent 8",
+                   "\x80"),
+  };
+  for (int i = 0; i < levels; ++i) {
+    const bool last = i + 1 == levels;
+    const std::string name = last ? "Im1" : "F" + std::to_string(i + 1);
+    const std::string target = std::to_string(last ? 5 : 7 + i) + " 0 R";
+    objects.push_back(StreamObject(
+        "/Type /XObject /Subtype /Form /BBox [0 0 612 792] "
+        "/Resources << /XObject << /" + name + " " + target + " >> >>",
+        last ? "q 10 0 0 10 20 20 cm /Im1 Do Q" : "q /" + name + " Do Q"));
+  }
+  return AssemblePdf(objects);
+}
+
+// A tagged page whose one marked-content run belongs to the innermost of
+// levels structure elements nested one inside the other.
+std::string DeepStructTreePdf(int levels) {
+  const std::string content =
+      "/P << /MCID 0 >> BDC BT /F1 12 Tf 72 700 Td (Deep) Tj ET EMC";
+  const int first = 8;
+  std::vector<std::string> objects = {
+      "<< /Type /Catalog /Pages 2 0 R /MarkInfo << /Marked true >> "
+      "/StructTreeRoot 6 0 R >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+      "/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R "
+      "/StructParents 0 >>",
+      StreamObject("", content),
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+      "<< /Type /StructTreeRoot /K " + std::to_string(first) +
+          " 0 R /ParentTree 7 0 R >>",
+      "<< /Nums [0 [" + std::to_string(first + levels - 1) + " 0 R]] >>",
+  };
+  for (int i = 0; i < levels; ++i) {
+    const int self = first + i;
+    const std::string parent = std::to_string(i == 0 ? 6 : self - 1) + " 0 R";
+    const bool last = i + 1 == levels;
+    objects.push_back("<< /Type /StructElem /S /" +
+                      std::string(last ? "P" : "Sect") + " /P " + parent +
+                      " /Pg 3 0 R /K " +
+                      (last ? std::string("0")
+                            : std::to_string(self + 1) + " 0 R") +
+                      " >>");
+  }
+  return AssemblePdf(objects);
+}
+
+// One page with three annotations: a subtype PDFium has no number for, one
+// it does, and one with no /Subtype at all.
+std::string AnnotationSubtypesPdf() {
+  return AssemblePdf({
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+      "/Annots [4 0 R 5 0 R 6 0 R] >>",
+      "<< /Type /Annot /Subtype /Projection /Rect [10 10 50 30] >>",
+      "<< /Type /Annot /Subtype /Square /Rect [10 40 50 60] >>",
+      "<< /Type /Annot /Rect [10 70 50 90] >>",
+  });
+}
+
+
 struct ParsedStream {
   pdfv1::ParseHeader header;
   pdfv1::DocMeta doc_meta;
@@ -183,6 +318,23 @@ struct ParsedStream {
   std::vector<pdfv1::EmbeddedFont> embedded_fonts;
   std::vector<pdfv1::FontRef> fonts;
   std::map<int, uint64_t> counts;
+  std::vector<pdfv1::ParseWarning> warnings;
+
+  // Warnings of one family whose message holds text; page -1 means the
+  // warning names no page.
+  int Warned(pdfv1::PdfFamily family, int page, const char* text) const {
+    int found = 0;
+    for (const auto& w : warnings) {
+      if (w.family() != family) continue;
+      if (page < 0 ? w.has_page_index()
+                   : !w.has_page_index() ||
+                         w.page_index() != static_cast<uint32_t>(page)) {
+        continue;
+      }
+      if (w.message().find(text) != std::string::npos) ++found;
+    }
+    return found;
+  }
 };
 
 ParsedStream ParseAll(pdfv1::PdfBackendService::Stub* stub,
@@ -234,6 +386,9 @@ ParsedStream ParseAll(pdfv1::PdfBackendService::Stub* stub,
       case pdfv1::ParseResponse::kTrailer:
         for (const auto& c : msg.trailer().counts()) {
           out.counts[c.family()] = c.count();
+        }
+        for (const auto& w : msg.trailer().warnings()) {
+          out.warnings.push_back(w);
         }
         break;
       default: break;
@@ -1296,6 +1451,164 @@ int main(int argc, char** argv) {
           "missing pages: a ParseStream render over a missing page ends ENGINE_ERROR");
     Check(run.RenderOf(7).size() == 1,
           "missing pages: the raster before the missing page was sent");
+  }
+
+  // A placed image and a thumbnail PDFium cannot decode: each is said, and
+  // neither leaves an empty EncodedImage behind.
+  {
+    const ParsedStream s = ParseAll(stub.get(), UndecodableImagesPdf(), true);
+    Check(s.has_page && s.page.images_size() == 1,
+          "undecodable image: the placed image is still listed");
+    Check(s.page.images_size() == 1 && !s.page.images(0).has_image(),
+          "undecodable image: no empty EncodedImage is sent for it");
+    Check(s.Warned(pdfv1::PDF_FAMILY_PLACED_IMAGES, 0, "could not decode") == 1,
+          "undecodable image: one warning names the page and the family");
+    Check(!s.page.has_thumbnail(),
+          "undecodable thumbnail: no empty EncodedImage is sent for it");
+    Check(s.Warned(pdfv1::PDF_FAMILY_THUMBNAILS, 0, "could not decode") == 1,
+          "undecodable thumbnail: one warning names the page and the family");
+    auto count = s.counts.find(pdfv1::PDF_FAMILY_THUMBNAILS);
+    Check(count == s.counts.end() || count->second == 0,
+          "undecodable thumbnail: it is not counted as sent");
+    const ParsedStream rich_heavy = ParseAll(stub.get(), rich, true);
+    Check(rich_heavy.Warned(pdfv1::PDF_FAMILY_THUMBNAILS, 0, "") == 0 &&
+              rich_heavy.Warned(pdfv1::PDF_FAMILY_PLACED_IMAGES, 0, "") == 0,
+          "a page with no thumbnail and readable images gets neither warning");
+  }
+
+  // Attachments whose bytes cannot be had: said when the bytes were asked
+  // for, and an entry PDFium cannot open is said either way.
+  {
+    const std::string pdf = AttachmentsWithoutDataPdf();
+    const ParsedStream heavy = ParseAll(stub.get(), pdf, true);
+    Check(heavy.attachments.size() == 2,
+          "attachments without data: the two PDFium can open are listed");
+    Check(heavy.Warned(pdfv1::PDF_FAMILY_ATTACHMENTS, -1, "external.txt") == 1,
+          "attachments without data: a file with no embedded stream is said");
+    Check(heavy.Warned(pdfv1::PDF_FAMILY_ATTACHMENTS, -1, "3 of 3") == 1,
+          "attachments without data: an entry PDFium cannot open is said");
+    Check(heavy.warnings.size() == 2,
+          "attachments without data: an empty file is not a warning");
+    for (const auto& a : heavy.attachments) {
+      if (a.name() == "empty.txt") {
+        Check(a.has_size_bytes() && a.size_bytes() == 0 && a.data().empty(),
+              "attachments without data: an empty file reports size 0");
+      } else {
+        Check(!a.has_size_bytes() && a.data().empty(),
+              "attachments without data: a file with no stream has no size");
+      }
+    }
+    const ParsedStream light = ParseAll(stub.get(), pdf, false);
+    Check(light.attachments.size() == 2 && light.warnings.size() == 1 &&
+              light.Warned(pdfv1::PDF_FAMILY_ATTACHMENTS, -1, "3 of 3") == 1,
+          "attachments without data: a light Parse only says the entry it "
+          "could not open");
+  }
+
+  // The outline walk stops at a fixed depth; what it left out is said.
+  {
+    auto deepest = [](const pdfv1::OutlineChunk& outline) {
+      int levels = 0;
+      const pdfv1::OutlineNode* node =
+          outline.roots_size() > 0 ? &outline.roots(0) : nullptr;
+      while (node != nullptr) {
+        ++levels;
+        node = node->children_size() > 0 ? &node->children(0) : nullptr;
+      }
+      return levels;
+    };
+    const ParsedStream deep = ParseAll(stub.get(), DeepOutlinePdf(70), false);
+    Check(deepest(deep.outline) == 65, "deep outline: 65 levels are sent");
+    Check(deep.Warned(pdfv1::PDF_FAMILY_OUTLINE, -1, "level 65") == 1,
+          "deep outline: the cut is a warning");
+    const ParsedStream whole = ParseAll(stub.get(), DeepOutlinePdf(65), false);
+    Check(deepest(whole.outline) == 65 && whole.warnings.empty(),
+          "an outline that fits the depth limit gets no warning");
+  }
+
+  // Annotation subtypes are the document's own names.
+  {
+    const ParsedStream s = ParseAll(stub.get(), AnnotationSubtypesPdf(), false);
+    Check(s.page.annotations_size() == 3, "annotation subtypes: all three listed");
+    if (s.page.annotations_size() == 3) {
+      Check(s.page.annotations(0).subtype_raw() == "Projection" &&
+                s.page.annotations(0).kind() ==
+                    pdfv1::ANNOTATION_KIND_UNSPECIFIED,
+            "annotation subtypes: an unlisted subtype keeps its real name");
+      Check(s.page.annotations(1).subtype_raw() == "Square" &&
+                s.page.annotations(1).kind() == pdfv1::ANNOTATION_KIND_SQUARE,
+            "annotation subtypes: a listed subtype is unchanged");
+      Check(s.page.annotations(2).subtype_raw().empty(),
+            "annotation subtypes: no /Subtype is not given a made-up name");
+    }
+    Check(s.Warned(pdfv1::PDF_FAMILY_ANNOTATIONS, 0, "no /Subtype") == 1,
+          "annotation subtypes: a missing /Subtype is a warning");
+  }
+
+  // PDFium reads no content of a form XObject nested more than 40 forms
+  // deep and says nothing. The image the innermost form draws is then
+  // missing, and so is any text: every family the forms feed says so.
+  {
+    const ParsedStream whole = ParseAll(stub.get(), NestedFormsPdf(40), false);
+    Check(whole.page.images_size() == 1 && whole.warnings.empty(),
+          "nested forms: 40 levels are read whole, with no warning");
+    const ParsedStream cut = ParseAll(stub.get(), NestedFormsPdf(41), false);
+    Check(cut.page.images_size() == 0,
+          "nested forms: pdfium reads nothing below 40 levels");
+    for (pdfv1::PdfFamily family :
+         {pdfv1::PDF_FAMILY_TEXT_CELLS, pdfv1::PDF_FAMILY_PLACED_IMAGES,
+          pdfv1::PDF_FAMILY_VECTOR_SHAPES, pdfv1::PDF_FAMILY_FONTS}) {
+      Check(cut.Warned(family, 0, "more than 40 forms deep") == 1,
+            "nested forms: each family the unread form feeds gets a warning");
+    }
+    Check(cut.warnings.size() == 4,
+          "nested forms: no other family is warned about");
+
+    // Only the families that were asked for.
+    grpc::ClientContext ctx;
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_data(NestedFormsPdf(70));
+    request.add_families(pdfv1::PDF_FAMILY_TEXT_CELLS);
+    auto reader = stub->Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    pdfv1::ParseTrailer trailer;
+    while (reader->Read(&msg)) {
+      if (msg.has_trailer()) trailer = msg.trailer();
+    }
+    Check(reader->Finish().ok(), "nested forms: text-only Parse OK");
+    Check(trailer.warnings_size() == 1 &&
+              trailer.warnings(0).family() == pdfv1::PDF_FAMILY_TEXT_CELLS &&
+              trailer.warnings(0).page_index() == 0,
+          "nested forms: a text-only Parse is told its text may be short");
+  }
+
+  // PDFium leaves out structure nested deeper than it follows and says
+  // nothing; the page's marked content with no element is how it shows.
+  {
+    auto depth_of = [](const pdfv1::StructTreeChunk& tree) {
+      int depth = 0;
+      const pdfv1::StructNode* node =
+          tree.roots_size() > 0 ? &tree.roots(0) : nullptr;
+      while (node != nullptr) {
+        ++depth;
+        node = node->children_size() > 0 ? &node->children(0) : nullptr;
+      }
+      return depth;
+    };
+    const ParsedStream whole = ParseAll(stub.get(), DeepStructTreePdf(33), false);
+    Check(depth_of(whole.struct_tree) == 33 && whole.warnings.empty(),
+          "deep structure: 33 levels arrive whole, with no warning");
+    const ParsedStream cut = ParseAll(stub.get(), DeepStructTreePdf(34), false);
+    Check(cut.struct_tree.roots_size() == 0,
+          "deep structure: pdfium returns nothing for 34 levels");
+    Check(cut.Warned(pdfv1::PDF_FAMILY_STRUCT_TREE, 0, "MCID 0") == 1 &&
+              cut.warnings.size() == 1,
+          "deep structure: the page's marked content with no element is a "
+          "warning");
+    const ParsedStream rich_light = ParseAll(stub.get(), rich, false);
+    Check(rich_light.Warned(pdfv1::PDF_FAMILY_STRUCT_TREE, 0, "") == 0,
+          "a tagged page whose marked content all has elements gets no "
+          "warning");
   }
 
   server->Shutdown();
