@@ -229,6 +229,32 @@ PageSpan SelectPages(bool has_range, const pdfv1::PageRange& range,
   return {static_cast<int>(begin), static_cast<int>(end)};
 }
 
+// A read-only form-fill environment over a loaded document: what PDFium
+// needs to read form fields and to draw widgets. A zeroed FPDF_FORMFILLINFO
+// carrying only the version is the setup with no callbacks. Declare it
+// after the LoadedDocument it is opened on, so it closes first.
+class ScopedFormEnvironment {
+ public:
+  ScopedFormEnvironment() {
+    std::memset(&info_, 0, sizeof(info_));
+    info_.version = 2;
+  }
+  ~ScopedFormEnvironment() {
+    if (handle_ != nullptr) FPDFDOC_ExitFormFillEnvironment(handle_);
+  }
+  ScopedFormEnvironment(const ScopedFormEnvironment&) = delete;
+  ScopedFormEnvironment& operator=(const ScopedFormEnvironment&) = delete;
+
+  void Open(FPDF_DOCUMENT doc) {
+    handle_ = FPDFDOC_InitFormFillEnvironment(doc, &info_);
+  }
+  FPDF_FORMHANDLE get() const { return handle_; }
+
+ private:
+  FPDF_FORMFILLINFO info_;
+  FPDF_FORMHANDLE handle_ = nullptr;
+};
+
 // Pages loaded in this process; see PdfiumEngine::PageLoads.
 uint64_t page_loads = 0;
 
@@ -397,18 +423,48 @@ std::vector<CharPlacement> ReadPlacements(FPDF_TEXTPAGE text_page, int char_coun
   return out;
 }
 
+void WarnText(uint32_t page_index, std::string message,
+              std::vector<pdfv1::ParseWarning>* warnings) {
+  pdfv1::ParseWarning& warning = warnings->emplace_back();
+  warning.set_page_index(page_index);
+  warning.set_family(pdfv1::PDF_FAMILY_TEXT_CELLS);
+  warning.set_message(std::move(message));
+}
+
 // Extracts text cells for one page at word granularity, the same shape the
 // in-process poppler path emits: split the character stream on whitespace,
 // take the union of the text rects each word occupies, and read font
 // identity from the word's first character.
+//
+// Text the cells cannot carry is counted in warnings, so a page that lost
+// some is not mistaken for a clean one: a text layer that does not load,
+// glyphs PDFium could not map to Unicode that the word splitter reads as
+// breaks, characters whose text is only their raw code, and words with no
+// character box.
 void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
                       bool want_programs, FontInterner* fonts,
                       pdfv1::FontTableChunk* new_fonts,
                       std::vector<pdfv1::EmbeddedFont>* embedded_fonts,
-                      uint64_t* cell_count) {
+                      uint64_t* cell_count,
+                      std::vector<pdfv1::ParseWarning>* warnings) {
+  const uint32_t page_index = chunk->page_index();
   FPDF_TEXTPAGE text_page = FPDFText_LoadPage(page);
-  if (text_page == nullptr) return;
+  if (text_page == nullptr) {
+    WarnText(page_index,
+             "pdfium could not load the text layer of this page; it has no "
+             "text cells",
+             warnings);
+    return;
+  }
   const int char_count = FPDFText_CountChars(text_page);
+  if (char_count < 0) {
+    WarnText(page_index,
+             "pdfium could not count the characters of this page; it has no "
+             "text cells",
+             warnings);
+    FPDFText_ClosePage(text_page);
+    return;
+  }
   // One code point per character index, read with GetUnicode. GetText
   // drops or folds characters with no text (control-code glyphs that figures
   // converted from EPS draw by the hundred), so its string runs shorter than
@@ -417,23 +473,36 @@ void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
   std::vector<unsigned int> codes(static_cast<size_t>(std::max(char_count, 0)));
   // A hyphen pdfium took for a line break reads 0x02 here; GetText writes
   // it as U+FFFE inside the word, and so does this, so "selec-" / "tion"
-  // stays one cell that consumers join.
+  // stays one cell that consumers join. Only IsHyphen says so: a glyph a
+  // font draws at character code 2 reads 0x02 as well and is no hyphen.
   // A ligature pdfium could not name reads as a control code; its text
   // comes from the font's own glyph name ("f_i" is "fi").
   GlyphRecovery recovery;
   std::vector<std::u32string> recovered(codes.size());
+  // Characters pdfium could not map to Unicode (no ToUnicode entry and no
+  // glyph name it knows) and that were not recovered: it reports the raw
+  // character code. Below 0x20 the word splitter takes that for a break
+  // and the glyph is in no cell; from 0x20 up the cell carries the raw
+  // code as if it were text.
+  uint64_t unmapped_breaks = 0;
+  uint64_t unmapped_raw = 0;
   for (int i = 0; i < char_count; ++i) {
     const unsigned int code = FPDFText_GetUnicode(text_page, i);
     const size_t at = static_cast<size_t>(i);
-    if (code == 0x02 || FPDFText_IsHyphen(text_page, i) == 1) {
+    if (FPDFText_IsHyphen(text_page, i) == 1) {
       codes[at] = 0xFFFE;
       continue;
     }
     recovered[at] = recovery.Recover(text_page, i, code);
     codes[at] = recovered[at].empty() ? code : static_cast<unsigned int>(recovered[at][0]);
+    if (recovered[at].empty() && FPDFText_IsGenerated(text_page, i) != 1 &&
+        FPDFText_HasUnicodeMapError(text_page, i) == 1) {
+      ++(code < 0x20 ? unmapped_breaks : unmapped_raw);
+    }
   }
   const std::vector<CharPlacement> placements = ReadPlacements(text_page, char_count, codes);
 
+  uint64_t boxless_words = 0;
   int start = -1;
   for (int i = 0; i <= char_count; ++i) {
     // A superscript or subscript glued to its word ("1https") starts a word.
@@ -499,7 +568,11 @@ void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
     }
     const int word_start = start;
     start = shift ? i : -1;
-    if (!has_box) continue;
+    if (!has_box) {
+      // A cell needs a box; a word drawn at no size has none.
+      ++boxless_words;
+      continue;
+    }
 
     auto* cell = chunk->add_text_cells();
     cell->set_text(Utf16ToUtf8(word));
@@ -545,6 +618,28 @@ void ExtractTextCells(FPDF_PAGE page, pdfv1::PageChunk* chunk,
     ++*cell_count;
   }
   FPDFText_ClosePage(text_page);
+  if (unmapped_breaks > 0) {
+    WarnText(page_index,
+             std::to_string(unmapped_breaks) +
+                 " glyph(s) drawn with a control code have no Unicode mapping "
+                 "pdfium or the font's glyph names could supply; each was read "
+                 "as a word break and its text is in no cell",
+             warnings);
+  }
+  if (unmapped_raw > 0) {
+    WarnText(page_index,
+             std::to_string(unmapped_raw) +
+                 " character(s) have no Unicode mapping; their cell text is "
+                 "the raw character code and may be wrong",
+             warnings);
+  }
+  if (boxless_words > 0) {
+    WarnText(page_index,
+             std::to_string(boxless_words) +
+                 " word(s) have no character box (drawn at no size) and are "
+                 "left out of the text cells",
+             warnings);
+  }
 }
 
 }  // namespace
@@ -650,7 +745,8 @@ bool PdfiumEngine::Parse(
     std::vector<pdfv1::EmbeddedFont> embedded_fonts;
     if (want_text) {
       ExtractTextCells(page, chunk, want_programs, &fonts, &new_fonts,
-                       &embedded_fonts, &counts[pdfv1::PDF_FAMILY_TEXT_CELLS]);
+                       &embedded_fonts, &counts[pdfv1::PDF_FAMILY_TEXT_CELLS],
+                       &warnings);
     }
     tier12::ExtractPageTier12(loaded.doc, page, form_handle, request, &fonts,
                               chunk, &new_fonts, &embedded_fonts, &warnings);
@@ -733,6 +829,20 @@ grpc::Status PdfiumEngine::Render(
   const PageSpan span = SelectPages(request.has_pages(), request.pages(),
                                     FPDF_GetPageCount(loaded.doc));
 
+  // FPDF_RenderPageBitmap draws every annotation except form widgets;
+  // those (typed values, check and radio marks) are drawn by FPDF_FFLDraw
+  // through a form-fill environment, which also writes the appearance of
+  // a field that has a value and no appearance stream.
+  ScopedFormEnvironment form;
+  if (!request.omit_annotations()) {
+    form.Open(loaded.doc);
+    if (form.get() == nullptr) {
+      return grpc::Status(grpc::StatusCode::INTERNAL,
+                          "pdfium could not open the form environment that "
+                          "draws form widgets");
+    }
+  }
+
   const bool gray = request.pixel_format() == pdfv1::PIXEL_FORMAT_GRAY8;
   const double scale = request.dpi() / 72.0;
   for (int i = span.begin; i < span.end; ++i) {
@@ -784,6 +894,9 @@ grpc::Status PdfiumEngine::Render(
     FPDFBitmap_FillRect(bitmap, 0, 0, width, height, background);
     int flags = request.omit_annotations() ? 0 : FPDF_ANNOT;
     FPDF_RenderPageBitmap(bitmap, page, 0, 0, width, height, 0, flags);
+    if (form.get() != nullptr) {
+      FPDF_FFLDraw(form.get(), bitmap, page, 0, 0, width, height, 0, flags);
+    }
 
     pdfv1::RenderResponse msg;
     auto* raster = msg.mutable_raster();

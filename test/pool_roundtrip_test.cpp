@@ -25,6 +25,7 @@
 
 #include <dirent.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -35,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -42,7 +44,9 @@
 #include <utility>
 #include <vector>
 
+#include <grpcpp/generic/generic_stub.h>
 #include <grpcpp/grpcpp.h>
+#include <grpcpp/support/byte_buffer.h>
 
 #include "ai/protomolt/parse/pdf/v1/pdf_backend_service.grpc.pb.h"
 #include "parse_stream_checks.h"
@@ -200,6 +204,61 @@ bool Running(pid_t pid) {
 bool FreezeWorker(pid_t front) {
   const std::vector<pid_t> workers = WorkerPids(front, "text");
   return workers.size() == 1 && kill(workers[0], SIGSTOP) == 0;
+}
+
+// What grpc.health.v1.Health/Check answers for the whole server (service
+// ""), as the HealthCheckResponse.ServingStatus number: 1 SERVING, 2
+// NOT_SERVING; -1 when the call fails. The request is the empty message
+// and the response one enum field, read here without generated stubs.
+int HealthStatus(int port) {
+  auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
+                                     grpc::InsecureChannelCredentials());
+  grpc::GenericStub stub(channel);
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+  const grpc::Slice empty;
+  const grpc::ByteBuffer request(&empty, 1);
+  grpc::ByteBuffer response;
+  std::promise<grpc::Status> done;
+  stub.UnaryCall(&ctx, "/grpc.health.v1.Health/Check", grpc::StubOptions(),
+                 &request, &response,
+                 [&done](grpc::Status status) { done.set_value(status); });
+  if (!done.get_future().get().ok()) return -1;
+  std::vector<grpc::Slice> slices;
+  if (!response.Dump(&slices).ok()) return -1;
+  std::string bytes;
+  for (const grpc::Slice& slice : slices) {
+    bytes.append(reinterpret_cast<const char*>(slice.begin()), slice.size());
+  }
+  // Field 1, varint: tag 0x08 then the status. An absent field is 0.
+  if (bytes.empty()) return 0;
+  return bytes.size() == 2 && bytes[0] == 0x08 ? bytes[1] : -1;
+}
+
+// Waits up to limit for the health status to become wanted.
+bool HealthBecomes(int port, int wanted, std::chrono::seconds limit) {
+  const auto deadline = std::chrono::steady_clock::now() + limit;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (HealthStatus(port) == wanted) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+  return HealthStatus(port) == wanted;
+}
+
+// The directory holding the front's worker sockets, read from a worker's
+// command line (--worker <socket path>); empty when it cannot be read.
+std::string SocketDirOf(pid_t worker) {
+  std::ifstream cmdline_file("/proc/" + std::to_string(worker) + "/cmdline",
+                             std::ios::binary);
+  std::ostringstream cmdline;
+  cmdline << cmdline_file.rdbuf();
+  const std::string all = cmdline.str();
+  const std::string flag = std::string("--worker") + '\0';
+  const size_t at = all.find(flag);
+  if (at == std::string::npos) return "";
+  const std::string socket_path = all.substr(at + flag.size()).c_str();
+  const size_t slash = socket_path.rfind('/');
+  return slash == std::string::npos ? "" : socket_path.substr(0, slash);
 }
 
 std::unique_ptr<pdfv1::PdfBackendService::Stub> Dial(int port) {
@@ -1228,6 +1287,48 @@ int main(int argc, char** argv) {
       Check(respawned.size() == 2 && later == respawned &&
                 std::ranges::all_of(later, [](pid_t pid) { return Running(pid); }),
             "the respawned worker is still the same running process seconds later");
+    }
+    StopFront(&front);
+  }
+
+  // The health service follows the pool. With its socket directory gone a
+  // worker cannot come back, so killing the only render worker leaves the
+  // front with none: health must say NOT_SERVING while Render cannot be
+  // served, and SERVING again once a render worker is back.
+  {
+    front = StartFront(argv[1], {{"GRPC_PDFIUM_WORKERS", "1"},
+                                 {"GRPC_PDFIUM_RENDER_WORKERS", "1"}});
+    if (front.port > 0) {
+      auto stub = Dial(front.port);
+      Check(HealthStatus(front.port) == 1, "health: SERVING with the pool up");
+      const std::vector<pid_t> render = WorkerPids(front.pid, "render");
+      const std::string socket_dir =
+          render.size() == 1 ? SocketDirOf(render[0]) : "";
+      Check(socket_dir.rfind("/tmp/grpc-pdfium-", 0) == 0,
+            "health: found the front's socket directory");
+      if (socket_dir.rfind("/tmp/grpc-pdfium-", 0) == 0) {
+        if (DIR* dir = opendir(socket_dir.c_str())) {
+          while (dirent* entry = readdir(dir)) {
+            const std::string name = entry->d_name;
+            if (name != "." && name != "..") {
+              unlink((socket_dir + "/" + name).c_str());
+            }
+          }
+          closedir(dir);
+        }
+        Check(rmdir(socket_dir.c_str()) == 0, "health: socket directory removed");
+        Check(kill(render[0], SIGKILL) == 0, "health: render worker killed");
+        Check(HealthBecomes(front.port, 2, std::chrono::seconds(15)),
+              "health: NOT_SERVING while no render worker is alive");
+        Check(ProbeWithin(stub.get(), fixture, std::chrono::seconds(20)).ok(),
+              "health: the text worker still answers Probe meanwhile");
+        Check(mkdir(socket_dir.c_str(), 0700) == 0,
+              "health: socket directory put back");
+        Check(HealthBecomes(front.port, 1, std::chrono::seconds(30)),
+              "health: SERVING again once a render worker is back");
+        Check(RenderPages(stub.get(), fixture, "", 36.0) > 0,
+              "health: Render is served after the recovery");
+      }
     }
     StopFront(&front);
   }

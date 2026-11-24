@@ -59,6 +59,14 @@ URIs, a signature's `/SubFilter` and `/M`, font names) go into proto
 `string` fields as valid UTF-8: well-formed UTF-8 passes through, and each
 byte of an ill-formed sequence is read as Latin-1 (`src/utf8.*`).
 
+Text the cells cannot carry is counted in `ParseTrailer.warnings`, one
+`PDF_FAMILY_TEXT_CELLS` warning per page and kind: glyphs PDFium could not
+map to Unicode (no ToUnicode entry, no glyph name) that read as a control
+code and split the word, characters whose cell text is only their raw
+character code, and words with no character box. PDFium's own line-break
+hyphen stays U+FFFE inside its cell; a glyph a font draws at character
+code 2 is not taken for one.
+
 Each worker also runs under an address-space limit,
 `GRPC_PDFIUM_WORKER_MAX_BYTES` (bytes; default 3 GiB, 0 turns it off,
 otherwise at least 256 MiB), with core dumps off. PDFium decodes a stream
@@ -120,7 +128,10 @@ cmake -S . -B build -DPDF_PROTO_LOCAL_DIR=/path/to/gRParse/backends
 GRPC_PDFIUM_PORT=50100 ./build/grpc_pdfium   # env override
 ```
 
-Health and server reflection are enabled; `Probe`, `Parse`, `Render`, and
+Health and server reflection are enabled. The health service follows the
+worker pool: it answers `NOT_SERVING` while the text role or the render role
+has no worker up, and the front exits at startup, before it binds, when a
+worker cannot be started. `Probe`, `Parse`, `Render`, and
 `GetServiceInfo` are the service surface. `GetServiceInfo` reports the
 backend identity (`backend_name` and `engine_version` are the same strings
 `Probe` reports), the build version (the image tag in Docker builds, a

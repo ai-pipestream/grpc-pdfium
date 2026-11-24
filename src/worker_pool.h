@@ -46,6 +46,12 @@ namespace grpc_pdfium {
 // builds by loading every page. A long document's inventory therefore runs
 // as long as its pages keep loading, and only a page that stops the engine
 // for the stall limit costs the worker (and the inventory cache it holds).
+//
+// The pool also knows whether it can serve. A worker is up when its process
+// runs and its socket answered. Construction fails unless every worker
+// comes up. After that the watchdog reaps a worker that dies while idle
+// and starts it again, and Serving() is true while each role has at least
+// one worker up, which is what the front's health service reports.
 class WorkerPool {
  public:
   struct Lease {
@@ -58,6 +64,8 @@ class WorkerPool {
   // Spawns text_size text workers and render_size render workers (each at
   // least one) running self_exe --worker <socket> --role <role>. Sockets
   // live under socket_dir. A stall_limit of zero turns the stall check off.
+  // Throws std::runtime_error, naming the worker, when one does not come
+  // up: a service none of whose requests could be served must not start.
   WorkerPool(std::string self_exe, std::string socket_dir, int text_size,
              int render_size, std::chrono::seconds stall_limit);
   ~WorkerPool();
@@ -78,6 +86,13 @@ class WorkerPool {
   // state is suspect). Returns true when the watchdog cut the lease.
   bool Release(const Lease& lease, bool failed);
 
+  // Whether each role has at least one worker up.
+  bool Serving();
+
+  // Installs the call made with Serving() now and again each time it
+  // changes. It runs under the pool's lock: it must not call the pool.
+  void SetHealthListener(std::function<void(bool)> listener);
+
   // The number of workers of role.
   int size(WorkerRole role) const;
   std::chrono::seconds stall_limit() const { return stall_limit_; }
@@ -94,6 +109,12 @@ class WorkerPool {
     // The front's end of the worker's progress socket pair; -1 when the
     // pair could not be made (the worker then runs without signalling).
     int progress_fd = -1;
+    // The process runs and its socket answered when last looked at.
+    bool up = false;
+    // While not up: when a process still coming up is given up on and
+    // replaced, and the earliest moment the watchdog starts another.
+    std::chrono::steady_clock::time_point give_up;
+    std::chrono::steady_clock::time_point next_start;
     // Leased, or being respawned.
     bool busy = false;
     // The call holding the lease; null while the slot is free or respawning,
@@ -109,18 +130,40 @@ class WorkerPool {
     bool call_cancelled = false;
   };
 
-  // A started worker process and its channel.
+  // A started worker process and its channel. pid is -1 when the fork
+  // failed or the process exited and was reaped.
   struct Process {
     pid_t pid = -1;
     std::shared_ptr<grpc::Channel> channel;
     std::unique_ptr<Stub> stub;
     int progress_fd = -1;
+    // Its socket answered.
+    bool connected = false;
+    // Why it did not, for the log and the startup error.
+    std::string failure;
   };
 
-  // Starts one worker on socket_path and waits for its socket to come up.
-  // Touches no shared state but the forker's queue, so a respawn runs it
-  // outside the lock.
+  // Starts one worker on socket_path without waiting for it. Touches no
+  // shared state but the forker's queue, so it runs outside the lock.
+  Process Start(const std::string& socket_path, WorkerRole role);
+
+  // Start, then a wait of up to 15 seconds for the socket to answer, cut
+  // short when the process exits first (it is reaped then).
   Process Spawn(const std::string& socket_path, WorkerRole role);
+
+  // Kills and reaps what the constructor started; for a constructor that
+  // is about to throw.
+  void StopStartedWorkers();
+
+  // Looks at the workers no call holds: reaps one that died, marks one
+  // whose socket now answers as up, and returns the slots to start again
+  // (each marked busy). Called by the watchdog with the lock held.
+  std::vector<size_t> CheckIdleWorkers(
+      std::chrono::steady_clock::time_point now);
+
+  // Reports Serving() to the listener when it changed. Lock held.
+  void PublishHealthLocked();
+  bool ServingLocked() const;
 
   // Runs fork_child on the forker thread and returns what it returned.
   //
@@ -149,6 +192,8 @@ class WorkerPool {
   std::condition_variable stopping_cv_;
   bool stopping_ = false;
   std::vector<Worker> workers_;
+  std::function<void(bool)> health_listener_;
+  bool published_serving_ = false;
   std::thread watchdog_;
   // The forks waiting for the forker thread, and the thread itself, which
   // starts before the first worker and stops after the last one is reaped.

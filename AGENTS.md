@@ -72,6 +72,13 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   dumps (`src/main.cpp`): PDFium decodes whole streams with no size check
   of its own, so that limit, not the engine's payload ceilings, is what
   bounds a decompression bomb.
+- The pool knows whether it can serve (`src/worker_pool.*`): a worker is up
+  when its process runs and its socket answered. The front refuses to start
+  (exit 1, before it binds) unless every first worker comes up. After that
+  the watchdog reaps a worker that dies while idle and starts it again, and
+  the gRPC health service says NOT_SERVING while a role (text or render) has
+  no worker up. `Acquire` leases a worker that is up first. Do not put the
+  health status back to a constant.
 - `ParseStream` (bidi) is assembled in the FRONT (`src/proxy_service_impl.cpp`,
   `src/parse_stream_session.*`): the front takes the chunked upload, then
   forwards the open and every `ParsePages` to text workers and every

@@ -179,10 +179,16 @@ bool SetPageBounds(FPDF_PAGEOBJECT obj, const FS_MATRIX& to_page,
   return true;
 }
 
-void FillDestination(FPDF_DOCUMENT doc, FPDF_DEST dest,
+// Fills out from dest. False, with out untouched, when the destination
+// names no page of this document: a page object that is in no page tree
+// (PDFium reports -1; common after pages were extracted from a larger
+// file) or a page number past the last page. Such a destination is never
+// reported as page 0.
+bool FillDestination(FPDF_DOCUMENT doc, FPDF_DEST dest,
                      pdfv1::PageDestination* out) {
-  out->set_page_index(
-      static_cast<uint32_t>(std::max(0, FPDFDest_GetDestPageIndex(doc, dest))));
+  const int page_index = FPDFDest_GetDestPageIndex(doc, dest);
+  if (page_index < 0 || page_index >= FPDF_GetPageCount(doc)) return false;
+  out->set_page_index(static_cast<uint32_t>(page_index));
   FPDF_BOOL has_x = 0;
   FPDF_BOOL has_y = 0;
   FPDF_BOOL has_zoom = 0;
@@ -195,6 +201,7 @@ void FillDestination(FPDF_DOCUMENT doc, FPDF_DEST dest,
     if (has_y) out->set_y(y);
     if (has_zoom) out->set_zoom(zoom);
   }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -260,14 +267,25 @@ std::vector<FPDF_BOOKMARK> UnseenChildren(FPDF_DOCUMENT doc,
   return children;
 }
 
+// An item whose destination names no page of the document keeps its title
+// with no destination and is counted in unresolved.
 void FillOutline(FPDF_DOCUMENT doc, FPDF_BOOKMARK bookmark,
-                 pdfv1::OutlineNode* node, int depth, SeenBookmarks* seen) {
+                 pdfv1::OutlineNode* node, int depth, SeenBookmarks* seen,
+                 uint64_t* unresolved) {
   node->set_title(Utf16Field([bookmark](void* buf, unsigned long len) {
     return FPDFBookmark_GetTitle(bookmark, buf, len);
   }));
+  auto fill = [doc, node, unresolved](FPDF_DEST dest) {
+    pdfv1::PageDestination destination;
+    if (FillDestination(doc, dest, &destination)) {
+      *node->mutable_destination() = std::move(destination);
+    } else {
+      ++*unresolved;
+    }
+  };
   FPDF_DEST dest = FPDFBookmark_GetDest(doc, bookmark);
   if (dest != nullptr) {
-    FillDestination(doc, dest, node->mutable_destination());
+    fill(dest);
   } else if (FPDF_ACTION action = FPDFBookmark_GetAction(bookmark)) {
     unsigned long type = FPDFAction_GetType(action);
     if (type == PDFACTION_URI) {
@@ -277,7 +295,7 @@ void FillOutline(FPDF_DOCUMENT doc, FPDF_BOOKMARK bookmark,
           })));
     } else if (type == PDFACTION_GOTO) {
       if (FPDF_DEST action_dest = FPDFAction_GetDest(doc, action)) {
-        FillDestination(doc, action_dest, node->mutable_destination());
+        fill(action_dest);
       }
     }
   }
@@ -285,7 +303,7 @@ void FillOutline(FPDF_DOCUMENT doc, FPDF_BOOKMARK bookmark,
   // the depth cap bounds a chain that is merely deep.
   if (depth >= 64) return;
   for (FPDF_BOOKMARK child : UnseenChildren(doc, bookmark, seen)) {
-    FillOutline(doc, child, node->add_children(), depth + 1, seen);
+    FillOutline(doc, child, node->add_children(), depth + 1, seen, unresolved);
   }
 }
 
@@ -406,9 +424,14 @@ void FillJavaScript(FPDF_DOCUMENT doc, pdfv1::JavaScriptChunk* chunk) {
 // Page-level families
 // ---------------------------------------------------------------------------
 
-void FillHyperlinks(FPDF_DOCUMENT doc, FPDF_PAGE page, pdfv1::PageChunk* chunk) {
+// A link whose destination names no page of the document is not emitted
+// (the contract: a link the engine cannot type is not emitted); one warning
+// per page says how many there were.
+void FillHyperlinks(FPDF_DOCUMENT doc, FPDF_PAGE page, pdfv1::PageChunk* chunk,
+                    std::vector<pdfv1::ParseWarning>* warnings) {
   int pos = 0;
   FPDF_LINK link = nullptr;
+  uint64_t unresolved = 0;
   while (FPDFLink_Enumerate(page, &pos, &link)) {
     if (link == nullptr) continue;
     FS_RECTF rect;
@@ -416,6 +439,16 @@ void FillHyperlinks(FPDF_DOCUMENT doc, FPDF_PAGE page, pdfv1::PageChunk* chunk) 
     pdfv1::Hyperlink out;
     SetBox(out.mutable_bbox(), rect.left, rect.bottom, rect.right, rect.top);
     bool typed = false;
+    bool dangling = false;
+    auto destination = [doc, &out, &typed, &dangling](FPDF_DEST dest) {
+      pdfv1::PageDestination target;
+      if (FillDestination(doc, dest, &target)) {
+        *out.mutable_destination() = std::move(target);
+        typed = true;
+      } else {
+        dangling = true;
+      }
+    };
     if (FPDF_ACTION action = FPDFLink_GetAction(link)) {
       unsigned long type = FPDFAction_GetType(action);
       if (type == PDFACTION_URI) {
@@ -426,19 +459,22 @@ void FillHyperlinks(FPDF_DOCUMENT doc, FPDF_PAGE page, pdfv1::PageChunk* chunk) 
         typed = true;
       } else if (type == PDFACTION_GOTO) {
         if (FPDF_DEST dest = FPDFAction_GetDest(doc, action)) {
-          FillDestination(doc, dest, out.mutable_destination());
-          typed = true;
+          destination(dest);
         }
       }
     }
-    if (!typed) {
-      if (FPDF_DEST dest = FPDFLink_GetDest(doc, link)) {
-        FillDestination(doc, dest, out.mutable_destination());
-        typed = true;
-      }
+    if (!typed && !dangling) {
+      if (FPDF_DEST dest = FPDFLink_GetDest(doc, link)) destination(dest);
     }
     // A link whose action the engine cannot type is not emitted.
     if (typed) *chunk->add_hyperlinks() = out;
+    if (!typed && dangling) ++unresolved;
+  }
+  if (unresolved > 0) {
+    Warn(warnings, chunk->page_index(), pdfv1::PDF_FAMILY_HYPERLINKS,
+         std::to_string(unresolved) +
+             " link(s) on this page point at a page the document does not "
+             "hold and are not emitted");
   }
 }
 
@@ -1090,8 +1126,15 @@ bool EmitDocLevelFamilies(
     pdfv1::ParseResponse msg;
     auto* chunk = msg.mutable_outline();
     SeenBookmarks seen;
+    uint64_t unresolved = 0;
     for (FPDF_BOOKMARK bookmark : UnseenChildren(doc, nullptr, &seen)) {
-      FillOutline(doc, bookmark, chunk->add_roots(), 0, &seen);
+      FillOutline(doc, bookmark, chunk->add_roots(), 0, &seen, &unresolved);
+    }
+    if (unresolved > 0) {
+      Warn(warnings, std::nullopt, pdfv1::PDF_FAMILY_OUTLINE,
+           std::to_string(unresolved) +
+               " outline item(s) point at a page the document does not hold; "
+               "each keeps its title and has no destination");
     }
     ShiftToCropSpace(origins, chunk);
     if (!emit(msg)) return false;
@@ -1147,7 +1190,7 @@ void ExtractPageTier12(FPDF_DOCUMENT doc, FPDF_PAGE page,
     WalkObjects(walk, nullptr, kIdentity, 0);
   }
   if (WantFamily(request, pdfv1::PDF_FAMILY_HYPERLINKS)) {
-    FillHyperlinks(doc, page, chunk);
+    FillHyperlinks(doc, page, chunk, warnings);
   }
   if (WantFamily(request, pdfv1::PDF_FAMILY_ANNOTATIONS)) {
     FillAnnotations(page, chunk);
